@@ -767,9 +767,7 @@ MetalCommandProcessor::EnsureTranslationSpirv(
                                    : ShaderCompileStatus::kFailed;
   }
   if (!translation->TryClaimTranslation()) {
-    // Don't wait on is_translated(): the shader's bindings are published by
-    // whichever modification translates first, so another one can set this
-    // while they are still half-written. The mutex orders it.
+    // Another thread is translating it.
     return ShaderCompileStatus::kPending;
   }
   if (!translator.TranslateAnalyzedShader(*translation)) {
@@ -917,19 +915,11 @@ Shader::Translation* MetalCommandProcessor::GetOrCreateHostTranslation(
       }
     }
   }
-  // Only the first translation of a shader gathers its bindings, so a sibling
-  // modification can still be filling them. The draw needs them.
-  if (status == ShaderCompileStatus::kReady && !shader.bindings_ready()) {
-    status = ShaderCompileStatus::kPending;
-  }
   if (status == ShaderCompileStatus::kPending && !allow_async) {
     // An earlier draw that could wait for this queued it. This caller can't, so
     // the only way to get it is to let the compile threads finish.
     AwaitAsyncCompiles();
     status = GetShaderCompileStatus(translation);
-    if (status == ShaderCompileStatus::kReady && !shader.bindings_ready()) {
-      status = ShaderCompileStatus::kPending;
-    }
   }
   *compile_status_out = status;
   return translation;
@@ -4925,15 +4915,6 @@ bool MetalCommandProcessor::IssueDrawDxil(
         return true;
       }
       return false;
-    }
-    // A sibling modification translating on a compile thread may still be
-    // filling the shader's bindings, which the draw below reads.
-    if (!dxil_vertex_shader->bindings_ready() && exact_shaders_required) {
-      AwaitAsyncCompiles();
-    }
-    if (!dxil_vertex_shader->bindings_ready()) {
-      LogShaderCompilePending(domain_translation, "domain");
-      return true;
     }
   } else {
     auto* vertex_translation =
