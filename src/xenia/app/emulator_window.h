@@ -13,6 +13,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "xenia/app/game_library.h"
 #include "xenia/emulator.h"
@@ -88,6 +89,10 @@ class EmulatorWindow {
 
   void OnEmulatorInitialized();
 
+  // Starts a new xenia process continuing this session with |args|, then
+  // |target| (UTF-8, empty for the game list). Returns whether it started.
+  bool SpawnEmulatorProcess(const std::vector<std::string>& args,
+                            const std::string& target);
   void LaunchTitleInNewProcess(const std::filesystem::path& path_to_file);
   xe::X_STATUS RunTitle(const std::filesystem::path& path_to_file);
   void UpdateTitle();

@@ -337,6 +337,27 @@ bool IsLaunchOnlyArg(std::string_view arg) {
   return false;
 }
 
+#if XE_PLATFORM_WIN32
+// Quotes one argument the way CommandLineToArgvW reads it back, where
+// backslashes before a quote escape it.
+std::u16string QuoteCommandLineArg(std::u16string_view arg) {
+  std::u16string quoted = u"\"";
+  size_t backslashes = 0;
+  for (char16_t c : arg) {
+    if (c == u'\\') {
+      ++backslashes;
+      continue;
+    }
+    quoted.append(c == u'"' ? backslashes * 2 + 1 : backslashes, u'\\');
+    backslashes = 0;
+    quoted += c;
+  }
+  quoted.append(backslashes * 2, u'\\');
+  quoted += u'"';
+  return quoted;
+}
+#endif
+
 #if XE_PLATFORM_MAC
 // execv of a universal binary inherits the parent's arch; arch(1) is the
 // only way to switch (e.g. Rosetta-running game spawning the native arm64
@@ -825,218 +846,56 @@ void EmulatorWindow::OnEmulatorInitialized() {
   }
 
   // Register callback for title-to-title launches from the kernel
-  emulator_->set_on_launch_new_title([this](const std::string& host_path,
-                                            const std::string& launch_module,
-                                            uint32_t launch_flags,
-                                            const std::string& launch_data,
-                                            const std::string& xbox_disc) {
-    XELOGI(
-        "Launching new title: host_path={}, launch_module={}, flags={}, "
-        "data_len={}, xbox_disc={}",
-        host_path, launch_module, launch_flags, launch_data.length(),
-        xbox_disc);
+  emulator_->set_on_launch_new_title(
+      [this](const std::string& host_path, const std::string& launch_module,
+             uint32_t launch_flags, const std::string& launch_data,
+             const std::string& xbox_disc) {
+        XELOGI(
+            "Launching new title: host_path={}, launch_module={}, flags={}, "
+            "data_len={}, xbox_disc={}",
+            host_path, launch_module, launch_flags, launch_data.length(),
+            xbox_disc);
 
-    std::filesystem::path executable_path = xe::filesystem::GetExecutablePath();
-
-    std::string slot_bindings_arg;
-    if (auto* is = emulator_ ? emulator_->input_system() : nullptr) {
-      auto l = is->lock();
-      slot_bindings_arg = is->SerializeSlotBindingsForPassthrough();
-    }
-
-#if XE_PLATFORM_WIN32
-    auto exe_path_u16 = xe::path_to_utf16(executable_path);
-    std::u16string cmd_line = u"\"" + exe_path_u16 + u"\"";
-
-    // Forward parent's CLI args.
-    int parent_argc = 0;
-    wchar_t** parent_argv = CommandLineToArgvW(GetCommandLineW(), &parent_argc);
-    if (parent_argv) {
-      for (int i = 1; i < parent_argc; ++i) {
-        std::u16string a(reinterpret_cast<const char16_t*>(parent_argv[i]));
-        if (a.empty() || a[0] != u'-') {
-          continue;  // positional game file — replaced below
+        std::vector<std::string> args;
+        // Preserve return_to_ui through the title-to-title chain
+        if (cvars::return_to_ui) {
+          args.push_back("--return_to_ui=true");
         }
-        if (IsLaunchOnlyArg(xe::to_utf8(a))) {
-          continue;
+        // Preserve fullscreen state, except when returning to UI (no game).
+        if (window_->IsFullscreen() && !host_path.empty()) {
+          args.push_back("--fullscreen=true");
         }
-        cmd_line += u" \"" + a + u"\"";
-      }
-      LocalFree(parent_argv);
-    }
-
-    // Append to log file instead of overwriting
-    cmd_line += u" --log_append=true";
-    // Preserve return_to_ui through the title-to-title chain
-    if (cvars::return_to_ui) {
-      cmd_line += u" --return_to_ui=true";
-    }
-    // Preserve fullscreen state, except when returning to UI (no game).
-    if (window_->IsFullscreen() && !host_path.empty()) {
-      cmd_line += u" --fullscreen=true";
-    }
-    if (!launch_module.empty()) {
-      cmd_line += u" --launch_module=\"" + xe::to_utf16(launch_module) + u"\"";
-    }
-    if (launch_flags != 0) {
-      cmd_line +=
-          u" --launch_flags=" + xe::to_utf16(fmt::format("{}", launch_flags));
-    }
-    if (!launch_data.empty()) {
-      cmd_line += u" --launch_data=" + xe::to_utf16(launch_data);
-    }
-    if (!xbox_disc.empty()) {
-      cmd_line += u" --launch_xbox_disc=\"" + xe::to_utf16(xbox_disc) + u"\"";
-    }
-    if (!slot_bindings_arg.empty()) {
-      cmd_line += u" --slot_bindings_passthrough=\"" +
-                  xe::to_utf16(slot_bindings_arg) + u"\"";
-    }
-    if (!host_path.empty()) {
-      cmd_line += u" \"" + xe::to_utf16(host_path) + u"\"";
-    }
-
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi = {};
-
-    if (!CreateProcessW(nullptr,
-                        const_cast<wchar_t*>(
-                            reinterpret_cast<const wchar_t*>(cmd_line.c_str())),
-                        nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr,
-                        nullptr, &si, &pi)) {
-      XELOGE("Failed to launch new process: {}", GetLastError());
-      return;
-    }
-    // Allow the new process to bring itself to the foreground
-    AllowSetForegroundWindow(pi.dwProcessId);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-#else
-    setenv("XENIA_WAIT_FOR_PID",
-           std::to_string(static_cast<long>(getpid())).c_str(), 1);
-    pid_t pid = fork();
-    if (pid == 0) {
-      // Child process
-      std::vector<std::string> arg_storage;
-      std::string gamemode_cmd;
-
-#if XE_PLATFORM_LINUX
-      // unsetenv on the false branch: the env var is inherited across the
-      // UI <-> title spawn chain, so a stale "1" from a previous launch
-      // would otherwise outlive the unchecked cvar.
-      if (cvars::use_mangohud) {
-        setenv("MANGOHUD", "1", 1);
-      } else {
-        unsetenv("MANGOHUD");
-      }
-      if (cvars::use_gamemode) {
-        gamemode_cmd = "gamemoderun";
-      }
-#endif
-#if XE_PLATFORM_MAC
-      if (cvars::use_metal_hud) {
-        setenv("MTL_HUD_ENABLED", "1", 1);
-      } else {
-        unsetenv("MTL_HUD_ENABLED");
-      }
-      // Empty host_path = returning to the UI/game list; the per-title
-      // rosetta override shouldn't follow us back, so use native there.
-      const bool want_rosetta = !host_path.empty() && cvars::use_rosetta;
-      const char* arch_flag = RosettaArchFlagIfSwitchNeeded(want_rosetta);
-#else
-      const char* arch_flag = nullptr;
-#endif
-      const bool use_arch_wrapper = (arch_flag != nullptr);
-
-      arg_storage.push_back(executable_path.string());
-
-      // Forward parent's CLI args.
-      for (int i = 1; i < xe::ui::g_argc; ++i) {
-        std::string_view a = xe::ui::g_argv[i];
-        if (a.empty() || a[0] != '-') {
-          continue;  // positional game file — replaced below
+        if (!launch_module.empty()) {
+          args.push_back("--launch_module=" + launch_module);
         }
-        if (IsLaunchOnlyArg(a)) {
-          continue;
+        if (launch_flags != 0) {
+          args.push_back(fmt::format("--launch_flags={}", launch_flags));
         }
-        arg_storage.emplace_back(a);
-      }
-
-      // Append to log file instead of overwriting
-      arg_storage.push_back("--log_append=true");
-      // Preserve return_to_ui through the title-to-title chain
-      if (cvars::return_to_ui) {
-        arg_storage.push_back("--return_to_ui=true");
-      }
-      // Preserve fullscreen state, except when returning to UI (no game).
-      if (window_->IsFullscreen() && !host_path.empty()) {
-        arg_storage.push_back("--fullscreen=true");
-      }
-      if (!launch_module.empty()) {
-        arg_storage.push_back("--launch_module=" + launch_module);
-      }
-      if (launch_flags != 0) {
-        arg_storage.push_back(fmt::format("--launch_flags={}", launch_flags));
-      }
-      if (!launch_data.empty()) {
-        arg_storage.push_back("--launch_data=" + launch_data);
-      }
-      if (!xbox_disc.empty()) {
-        arg_storage.push_back("--launch_xbox_disc=" + xbox_disc);
-      }
-      if (!slot_bindings_arg.empty()) {
-        arg_storage.push_back("--slot_bindings_passthrough=" +
-                              slot_bindings_arg);
-      }
-      if (!host_path.empty()) {
-        arg_storage.push_back(host_path);
-      }
-
-      // arg_storage is fully populated now — take c_str() pointers only after
-      // the last push_back, otherwise a reallocation leaves them dangling.
-      std::vector<const char*> argv;
-      if (!gamemode_cmd.empty()) {
-        argv.push_back(gamemode_cmd.c_str());
-      }
-      if (use_arch_wrapper) {
-        argv.push_back("arch");
-        argv.push_back(arch_flag);
-      }
-      for (const std::string& arg : arg_storage) {
-        argv.push_back(arg.c_str());
-      }
-      argv.push_back(nullptr);
-
-      if (!gamemode_cmd.empty()) {
-        execvp(gamemode_cmd.c_str(), const_cast<char**>(argv.data()));
-      } else if (use_arch_wrapper) {
-        execvp("arch", const_cast<char**>(argv.data()));
-      } else {
-        execv(executable_path.c_str(), const_cast<char**>(argv.data()));
-      }
-      _exit(1);
-    } else if (pid < 0) {
-      XELOGE("Failed to fork process");
-      return;
-    }
-#endif
-    xe::FlushLog();
-    std::thread([]() {
-      std::this_thread::sleep_for(std::chrono::seconds(5));
-      XELOGW("UI loop drain exceeded watchdog timeout, forcing exit");
-      xe::FlushLog();
-      std::_Exit(0);
-    }).detach();
-    // The title runs on into the exit, which deletes the window without closing
-    // it, so the title's frames are cut off from the window first. That comes
-    // after the quit has run what's queued and stopped taking more, so nothing
-    // reattaches them.
-    app_context_.CallInUIThreadDeferred([this]() {
-      app_context_.QuitFromUIThread();
-      ShutdownGraphicsSystemPresenterPainting();
-    });
-  });
+        if (!launch_data.empty()) {
+          args.push_back("--launch_data=" + launch_data);
+        }
+        if (!xbox_disc.empty()) {
+          args.push_back("--launch_xbox_disc=" + xbox_disc);
+        }
+        if (!SpawnEmulatorProcess(args, host_path)) {
+          return;
+        }
+        xe::FlushLog();
+        std::thread([]() {
+          std::this_thread::sleep_for(std::chrono::seconds(5));
+          XELOGW("UI loop drain exceeded watchdog timeout, forcing exit");
+          xe::FlushLog();
+          std::_Exit(0);
+        }).detach();
+        // The title runs on into the exit, which deletes the window without
+        // closing it, so the title's frames are cut off from the window first.
+        // That comes after the quit has run what's queued and stopped taking
+        // more, so nothing reattaches them.
+        app_context_.CallInUIThreadDeferred([this]() {
+          app_context_.QuitFromUIThread();
+          ShutdownGraphicsSystemPresenterPainting();
+        });
+      });
 
   emulator_->set_on_exit_to_dashboard(
       [this]() { return StopTitleAndReturnToList(); });
@@ -3415,107 +3274,118 @@ std::string EmulatorWindow::CanonicalizeFileExtension(
   return xe::utf8::lower_ascii(xe::path_to_utf8(path.extension()));
 }
 
-void EmulatorWindow::LaunchTitleInNewProcess(
-    const std::filesystem::path& path_to_file) {
-  // Get the path to the current executable
+bool EmulatorWindow::SpawnEmulatorProcess(const std::vector<std::string>& args,
+                                          const std::string& target) {
   std::filesystem::path executable_path = xe::filesystem::GetExecutablePath();
 
-  // Verify the file exists
-  if (!path_to_file.empty() && !std::filesystem::exists(path_to_file)) {
-    XELOGE("Cannot launch title - file not found: {}",
-           xe::path_to_utf8(path_to_file));
-    return;
-  }
-
-  std::string slot_bindings_arg;
-  if (auto* is = emulator_ ? emulator_->input_system() : nullptr) {
-    auto l = is->lock();
-    slot_bindings_arg = is->SerializeSlotBindingsForPassthrough();
-  }
-
+  // The new process continues this session: it takes this one's options and
+  // appends to the log rather than truncating it. Positional arguments are the
+  // game file, which |target| replaces.
+  std::vector<std::string> child_args;
+  auto forward_arg = [&](std::string arg) {
+    if (!IsLaunchOnlyArg(arg)) {
+      child_args.push_back(std::move(arg));
+    }
+  };
 #if XE_PLATFORM_WIN32
-  // On Windows, build command line using Xenia's Unicode path handling
-  auto exe_path_u16 = xe::path_to_utf16(executable_path);
-
-  // Build full command line with quotes for paths that may contain spaces
-  std::u16string cmd_line = u"\"" + exe_path_u16 + u"\"";
-
-  // Forward parent's CLI args.
   int parent_argc = 0;
   wchar_t** parent_argv = CommandLineToArgvW(GetCommandLineW(), &parent_argc);
   if (parent_argv) {
     for (int i = 1; i < parent_argc; ++i) {
-      std::u16string a(reinterpret_cast<const char16_t*>(parent_argv[i]));
-      if (a.empty() || a[0] != u'-') {
-        continue;  // positional game file — replaced below
+      if (parent_argv[i][0] == L'-') {
+        forward_arg(
+            xe::to_utf8(reinterpret_cast<const char16_t*>(parent_argv[i])));
       }
-      if (IsLaunchOnlyArg(xe::to_utf8(a))) {
-        continue;
-      }
-      cmd_line += u" \"" + a + u"\"";
     }
     LocalFree(parent_argv);
   }
-
-  // Tell game process to return to UI when it exits
-  cmd_line += u" --return_to_ui=true";
-
-  if (!slot_bindings_arg.empty()) {
-    cmd_line += u" --slot_bindings_passthrough=\"" +
-                xe::to_utf16(slot_bindings_arg) + u"\"";
+#else
+  for (int i = 1; i < xe::ui::g_argc; ++i) {
+    if (xe::ui::g_argv[i][0] == '-') {
+      forward_arg(xe::ui::g_argv[i]);
+    }
+  }
+#endif
+  child_args.push_back("--log_append=true");
+  child_args.insert(child_args.end(), args.begin(), args.end());
+  if (auto* input_system = emulator_ ? emulator_->input_system() : nullptr) {
+    auto lock = input_system->lock();
+    std::string slot_bindings =
+        input_system->SerializeSlotBindingsForPassthrough();
+    if (!slot_bindings.empty()) {
+      child_args.push_back("--slot_bindings_passthrough=" + slot_bindings);
+    }
+  }
+  if (!target.empty()) {
+    child_args.push_back(target);
   }
 
-  // Add the target game file
-  if (!path_to_file.empty()) {
-    auto game_path_u16 = xe::path_to_utf16(path_to_file);
-    cmd_line += u" \"" + game_path_u16 + u"\"";
+#if XE_PLATFORM_WIN32
+  std::u16string command_line =
+      QuoteCommandLineArg(xe::path_to_utf16(executable_path));
+  for (const std::string& arg : child_args) {
+    command_line += u' ';
+    command_line += QuoteCommandLineArg(xe::to_utf16(arg));
   }
-
   STARTUPINFOW si = {};
   si.cb = sizeof(si);
   PROCESS_INFORMATION pi = {};
-
-  if (!CreateProcessW(nullptr,  // Application name (use command line)
-                      const_cast<wchar_t*>(reinterpret_cast<const wchar_t*>(
-                          cmd_line.c_str())),  // Command line
-                      nullptr,                 // Process attributes
-                      nullptr,                 // Thread attributes
-                      FALSE,                   // Inherit handles
-                      CREATE_NEW_CONSOLE,      // Creation flags
-                      nullptr,                 // Environment
-                      nullptr,                 // Current directory
-                      &si,                     // Startup info
-                      &pi)) {                  // Process information
+  if (!CreateProcessW(nullptr, reinterpret_cast<wchar_t*>(command_line.data()),
+                      nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr,
+                      nullptr, &si, &pi)) {
     XELOGE("Failed to launch new process: {}", GetLastError());
-    return;
+    return false;
   }
-
   // Allow the new process to bring itself to the foreground
   AllowSetForegroundWindow(pi.dwProcessId);
   CloseHandle(pi.hProcess);
   CloseHandle(pi.hThread);
 #else
-  // On Linux/Unix, use fork/exec for proper process creation
+  std::string gamemode_cmd;
+#if XE_PLATFORM_LINUX
+  if (cvars::use_gamemode) {
+    gamemode_cmd = "gamemoderun";
+  }
+#endif
+#if XE_PLATFORM_MAC
+  // Returning to the game list, the per-title rosetta override shouldn't follow
+  // back, so use native there.
+  const char* arch_flag =
+      RosettaArchFlagIfSwitchNeeded(!target.empty() && cvars::use_rosetta);
+#else
+  const char* arch_flag = nullptr;
+#endif
+  // Built before the fork, so the child only adjusts its environment and
+  // execs.
+  std::string executable = executable_path.string();
+  std::vector<const char*> argv;
+  if (!gamemode_cmd.empty()) {
+    argv.push_back(gamemode_cmd.c_str());
+  }
+  if (arch_flag) {
+    argv.push_back("arch");
+    argv.push_back(arch_flag);
+  }
+  argv.push_back(executable.c_str());
+  for (const std::string& arg : child_args) {
+    argv.push_back(arg.c_str());
+  }
+  argv.push_back(nullptr);
+
   setenv("XENIA_WAIT_FOR_PID",
          std::to_string(static_cast<long>(getpid())).c_str(), 1);
   pid_t pid = fork();
-
   if (pid == 0) {
-    // Child process
-    std::vector<const char*> argv;
-    std::string gamemode_cmd;
-
 #if XE_PLATFORM_LINUX
-    // See OnEmulatorInitialized: env vars survive the UI<->title spawn chain.
+    // unsetenv on the false branch: the env var is inherited across the
+    // UI <-> title spawn chain, so a stale "1" from a previous launch would
+    // otherwise outlive the unchecked cvar.
     if (cvars::use_mangohud) {
       setenv("MANGOHUD", "1", 1);
     } else {
       unsetenv("MANGOHUD");
     }
-    if (cvars::use_gamemode) {
-      gamemode_cmd = "gamemoderun";
-      argv.push_back(gamemode_cmd.c_str());
-    } else {
+    if (!cvars::use_gamemode) {
       StripGameModeFromLdPreload();  // GameMode off → drop any inherited wrap
     }
 #endif
@@ -3525,69 +3395,38 @@ void EmulatorWindow::LaunchTitleInNewProcess(
     } else {
       unsetenv("MTL_HUD_ENABLED");
     }
-    const char* arch_flag = RosettaArchFlagIfSwitchNeeded(cvars::use_rosetta);
-#else
-    const char* arch_flag = nullptr;
 #endif
-    const bool use_arch_wrapper = (arch_flag != nullptr);
-    if (use_arch_wrapper) {
-      argv.push_back("arch");
-      argv.push_back(arch_flag);
-    }
-
-    argv.push_back(executable_path.c_str());
-
-    // Forward parent's CLI args.
-    std::vector<std::string> forwarded_args;
-    for (int i = 1; i < xe::ui::g_argc; ++i) {
-      std::string_view a = xe::ui::g_argv[i];
-      if (a.empty() || a[0] != '-') {
-        continue;  // positional game file — replaced below
-      }
-      if (IsLaunchOnlyArg(a)) {
-        continue;
-      }
-      forwarded_args.emplace_back(a);
-    }
-    for (const auto& f : forwarded_args) {
-      argv.push_back(f.c_str());
-    }
-
-    // Tell game process to return to UI when it exits
-    argv.push_back("--return_to_ui=true");
-
-    std::string slot_bindings_cli_arg;
-    if (!slot_bindings_arg.empty()) {
-      slot_bindings_cli_arg =
-          "--slot_bindings_passthrough=" + slot_bindings_arg;
-      argv.push_back(slot_bindings_cli_arg.c_str());
-    }
-
-    // Add the target game file
-    std::string target_arg;
-    if (!path_to_file.empty()) {
-      target_arg = path_to_file.string();
-      argv.push_back(target_arg.c_str());
-    }
-    argv.push_back(nullptr);
-
     if (!gamemode_cmd.empty()) {
       execvp(gamemode_cmd.c_str(), const_cast<char**>(argv.data()));
-    } else if (use_arch_wrapper) {
+    } else if (arch_flag) {
       execvp("arch", const_cast<char**>(argv.data()));
     } else {
-      execv(executable_path.c_str(), const_cast<char**>(argv.data()));
+      execv(executable.c_str(), const_cast<char**>(argv.data()));
     }
-
-    // If exec returns, it failed
-    XELOGE("Failed to execute: {}", executable_path.string());
     _exit(1);
-  } else if (pid < 0) {
-    // Fork failed
+  }
+  if (pid < 0) {
     XELOGE("Failed to fork process");
-    return;
+    return false;
   }
 #endif
+  return true;
+}
+
+void EmulatorWindow::LaunchTitleInNewProcess(
+    const std::filesystem::path& path_to_file) {
+  // Verify the file exists
+  if (!path_to_file.empty() && !std::filesystem::exists(path_to_file)) {
+    XELOGE("Cannot launch title - file not found: {}",
+           xe::path_to_utf8(path_to_file));
+    return;
+  }
+
+  // Tell game process to return to UI when it exits
+  if (!SpawnEmulatorProcess({"--return_to_ui=true"},
+                            xe::path_to_utf8(path_to_file))) {
+    return;
+  }
 
   XELOGI("Launched title in new process: {}", xe::path_to_utf8(path_to_file));
 
