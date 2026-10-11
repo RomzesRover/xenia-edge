@@ -203,6 +203,10 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   bool CanCreatePipelineAsync(bool has_pixel_shader) const;
 
  private:
+  VulkanShader* LoadShader(xenos::ShaderType shader_type,
+                           const uint32_t* host_address, uint32_t dword_count,
+                           uint64_t data_hash);
+
   // PipelineGeometryShader and GeometryShaderKey come from
   // GuestSpirvShaderCache.
   using GeometryShaderKey = GuestSpirvShaderCache::GeometryShaderKey;

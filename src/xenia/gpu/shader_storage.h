@@ -11,6 +11,7 @@
 #define XENIA_GPU_SHADER_STORAGE_H_
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -194,11 +195,11 @@ class ShaderStorageWriter {
     uint32_t version;         // Pipeline description version
   };
 
-  // Callback for loading a shader from ucode data.
-  // Return true to continue reading, false to stop.
-  using ShaderLoadCallback =
-      std::function<bool(xenos::ShaderType type, const uint32_t* ucode_dwords,
-                         uint32_t ucode_dword_count, uint64_t ucode_data_hash)>;
+  // Loads a shader read from storage into the backend's cache, returning it, or
+  // nullptr if it can't be created.
+  using ShaderLoadCallback = std::function<Shader*(
+      xenos::ShaderType type, const uint32_t* ucode_dwords,
+      uint32_t ucode_dword_count, uint64_t ucode_data_hash)>;
 
   // Callback for translating shaders. Called with the set of
   // (ucode_hash, modification) pairs that need translation.
@@ -324,20 +325,22 @@ class ShaderStorageWriter {
     }
     xe::filesystem::Seek(shader_storage_file_, 0, SEEK_SET);
 
-    // Load shaders from storage.
-    size_t shaders_loaded = 0;
+    // Load shaders from storage. Each is marked as stored so a draw doesn't
+    // write it again, which also skips one stored twice.
+    std::vector<Shader*> shaders_loaded;
     ShaderStorageFileHeader shader_header;
     if (ValidateShaderStorageHeader(shader_storage_file_, shader_header)) {
       uint64_t shader_storage_valid_bytes = ReadShaderEntries(
           shader_storage_file_,
           [&](xenos::ShaderType type, const uint32_t* ucode_dwords,
               uint32_t ucode_dword_count, uint64_t ucode_data_hash) {
-            if (load_shader(type, ucode_dwords, ucode_dword_count,
-                            ucode_data_hash)) {
-              ++shaders_loaded;
-              return true;
+            Shader* shader = load_shader(type, ucode_dwords, ucode_dword_count,
+                                         ucode_data_hash);
+            if (shader && shader->ucode_storage_index() != storage_index_) {
+              shader->set_ucode_storage_index(storage_index_);
+              shaders_loaded.push_back(shader);
             }
-            return false;
+            return true;
           });
       xe::filesystem::TruncateStdioFile(shader_storage_file_,
                                         shader_storage_valid_bytes);
@@ -353,7 +356,7 @@ class ShaderStorageWriter {
         return false;
       }
     }
-    XELOGI("Loaded {} shaders from storage", shaders_loaded);
+    XELOGI("Loaded {} shaders from storage", shaders_loaded.size());
 
     // Collect shader translations needed from pipeline descriptions.
     std::set<std::pair<uint64_t, uint64_t>> translations_needed;
@@ -367,6 +370,8 @@ class ShaderStorageWriter {
     }
     XELOGI("Loaded {} pipeline descriptions, {} shader translations needed",
            pipeline_descriptions_out.size(), translations_needed.size());
+
+    AnalyzeStoredShaders(shaders_loaded, translations_needed);
 
     // Translate shaders (callback handles parallel translation).
     if (!translations_needed.empty() && translate_shaders) {
@@ -463,6 +468,64 @@ class ShaderStorageWriter {
   }
 
  private:
+  // Analyzes the loaded shaders a stored pipeline uses, in parallel. Analysis
+  // is per ucode, so the modification in the pair is ignored. A draw analyzes
+  // any other shader when it first uses it.
+  static void AnalyzeStoredShaders(
+      const std::vector<Shader*>& shaders_loaded,
+      const std::set<std::pair<uint64_t, uint64_t>>& translations_needed) {
+    uint64_t analysis_start = xe::Clock::QueryHostTickCount();
+    std::vector<Shader*> shaders_to_analyze;
+    for (Shader* shader : shaders_loaded) {
+      uint64_t ucode_data_hash = shader->ucode_data_hash();
+      if (!shader->is_ucode_analyzed() &&
+          translations_needed.lower_bound(
+              std::make_pair(ucode_data_hash, uint64_t(0))) !=
+              translations_needed.upper_bound(
+                  std::make_pair(ucode_data_hash, UINT64_MAX))) {
+        shaders_to_analyze.push_back(shader);
+      }
+    }
+    if (shaders_to_analyze.empty()) {
+      return;
+    }
+
+    std::atomic<size_t> analysis_index{0};
+    auto analyze_function = [&]() {
+      StringBuffer ucode_disasm_buffer;
+      while (true) {
+        size_t index = analysis_index.fetch_add(1);
+        if (index >= shaders_to_analyze.size()) {
+          break;
+        }
+        shaders_to_analyze[index]->AnalyzeUcode(ucode_disasm_buffer);
+      }
+    };
+    size_t logical_processor_count = xe::threading::logical_processor_count();
+    if (!logical_processor_count) {
+      logical_processor_count = 6;
+    }
+    size_t thread_count = std::min(logical_processor_count - size_t(1),
+                                   shaders_to_analyze.size());
+    std::vector<std::unique_ptr<xe::threading::Thread>> analysis_threads;
+    for (size_t i = 0; i < thread_count; ++i) {
+      auto thread = xe::threading::Thread::Create({}, analyze_function);
+      if (thread) {
+        thread->set_name("Shader Analysis");
+        analysis_threads.push_back(std::move(thread));
+      }
+    }
+    // The calling thread takes part too.
+    analyze_function();
+    for (auto& thread : analysis_threads) {
+      xe::threading::Wait(thread.get(), false);
+    }
+
+    XELOGI("Analyzed {} shaders in {} ms", shaders_to_analyze.size(),
+           (xe::Clock::QueryHostTickCount() - analysis_start) * 1000 /
+               xe::Clock::QueryHostTickFrequency());
+  }
+
   void WriteThread() {
     ShaderStoredHeader shader_header;
     std::memset(&shader_header, 0, sizeof(shader_header));

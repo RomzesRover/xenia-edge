@@ -18,7 +18,6 @@
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
-#include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
@@ -298,28 +297,17 @@ void PipelineCache::InitializeShaderStorage(
   pipeline_config.version = PipelineDescription::kVersion +
                             SpirvShaderTranslator::Modification::kVersion;
 
-  uint32_t storage_index = storage_writer_.storage_index() + 1;
-
+  // D3D12 renders only through spirv_to_dxil, so the translations are left to
+  // the pipeline creation.
   std::vector<PipelineStoredDescription> pipeline_stored_descriptions;
   if (!storage_writer_.InitializeShaderStorage(
           cache_root, title_id, pipeline_config,
-          // Shader load callback.
-          [&](xenos::ShaderType type, const uint32_t* ucode_dwords,
-              uint32_t ucode_dword_count, uint64_t ucode_data_hash) {
-            SpirvShader* shader = LoadShader(
-                type, ucode_dwords, ucode_dword_count, ucode_data_hash);
-            if (shader->ucode_storage_index() == storage_index) {
-              return true;  // Already loaded.
-            }
-            shader->set_ucode_storage_index(storage_index);
-            return true;
+          [this](xenos::ShaderType type, const uint32_t* ucode_dwords,
+                 uint32_t ucode_dword_count, uint64_t ucode_data_hash) {
+            return LoadShader(type, ucode_dwords, ucode_dword_count,
+                              ucode_data_hash);
           },
-          // Shader analyze callback. Only the ucode analysis is needed.
-          [this](const std::set<std::pair<uint64_t, uint64_t>>
-                     & translations_needed) {
-            AnalyzeShadersForStorage(translations_needed);
-          },
-          pipeline_stored_descriptions)) {
+          nullptr, pipeline_stored_descriptions)) {
     if (completion_callback) {
       completion_callback();
     }
@@ -1403,72 +1391,6 @@ bool PipelineCache::ConfigurePipeline(
   *pipeline_handle_out = new_pipeline;
   *root_signature_out = runtime_description.root_signature;
   return true;
-}
-
-void PipelineCache::AnalyzeShadersForStorage(
-    const std::set<std::pair<uint64_t, uint64_t>>& translations_needed) {
-  uint64_t analysis_start = xe::Clock::QueryHostTickCount();
-
-  // Only shaders referenced by a stored pipeline need analyzing. Analysis is
-  // per ucode, not per translation, so the modification in the pair is ignored
-  // here.
-  std::vector<SpirvShader*> shaders_to_analyze;
-  shaders_to_analyze.reserve(shaders_.size());
-  for (auto& shader_pair : shaders_) {
-    SpirvShader* shader = shader_pair.second;
-    uint64_t ucode_data_hash = shader->ucode_data_hash();
-    if (translations_needed.lower_bound(
-            std::make_pair(ucode_data_hash, uint64_t(0))) !=
-        translations_needed.upper_bound(
-            std::make_pair(ucode_data_hash, UINT64_MAX))) {
-      shaders_to_analyze.push_back(shader);
-    }
-  }
-
-  if (shaders_to_analyze.empty()) {
-    return;
-  }
-
-  std::atomic<size_t> analysis_index{0};
-  auto analyze_function = [&]() {
-    StringBuffer ucode_disasm_buffer;
-    while (true) {
-      size_t index = analysis_index.fetch_add(1);
-      if (index >= shaders_to_analyze.size()) {
-        break;
-      }
-      SpirvShader* shader = shaders_to_analyze[index];
-      if (!shader->is_ucode_analyzed()) {
-        shader->AnalyzeUcode(ucode_disasm_buffer);
-      }
-    }
-  };
-
-  size_t logical_processor_count = xe::threading::logical_processor_count();
-  if (!logical_processor_count) {
-    logical_processor_count = 6;
-  }
-  size_t thread_count =
-      std::min(logical_processor_count - size_t(1), shaders_to_analyze.size());
-  std::vector<std::unique_ptr<xe::threading::Thread>> analysis_threads;
-  for (size_t i = 0; i < thread_count; ++i) {
-    auto thread = xe::threading::Thread::Create({}, analyze_function);
-    if (thread) {
-      thread->set_name("Shader Analysis");
-      analysis_threads.push_back(std::move(thread));
-    }
-  }
-
-  // Main thread also participates.
-  analyze_function();
-
-  for (auto& thread : analysis_threads) {
-    xe::threading::Wait(thread.get(), false);
-  }
-
-  XELOGI("Analyzed {} shaders in {} ms", shaders_to_analyze.size(),
-         (xe::Clock::QueryHostTickCount() - analysis_start) * 1000 /
-             xe::Clock::QueryHostTickFrequency());
 }
 
 void PipelineCache::GetHostDepthBias(bool primitive_polygonal,

@@ -503,8 +503,14 @@ VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
                                               const uint32_t* host_address,
                                               uint32_t dword_count) {
   // Hash the input memory and lookup the shader.
-  uint64_t data_hash =
-      XXH3_64bits(host_address, dword_count * sizeof(uint32_t));
+  return LoadShader(shader_type, host_address, dword_count,
+                    XXH3_64bits(host_address, dword_count * sizeof(uint32_t)));
+}
+
+VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
+                                              const uint32_t* host_address,
+                                              uint32_t dword_count,
+                                              uint64_t data_hash) {
   auto it = shaders_.find(data_hash);
   if (it != shaders_.end()) {
     // Shader has been previously loaded.
@@ -1065,6 +1071,11 @@ void VulkanPipelineCache::TranslateShadersForStorage(
       continue;
     }
     VulkanShader* shader = shader_it->second;
+    // Translation needs the ucode analyzed, which the storage load did only for
+    // the shaders it read this time.
+    if (!shader->is_ucode_analyzed()) {
+      shader->AnalyzeUcode(ucode_disasm_buffer_);
+    }
     VulkanShader::VulkanTranslation* translation =
         static_cast<VulkanShader::VulkanTranslation*>(
             shader->GetOrCreateTranslation(needed.second));
@@ -2523,24 +2534,13 @@ void VulkanPipelineCache::InitializeShaderStorage(
   pipeline_config.version = PipelineDescription::kVersion +
                             SpirvShaderTranslator::Modification::kVersion;
 
-  uint32_t storage_index = storage_writer_.storage_index() + 1;
-
   std::vector<PipelineStoredDescription> pipeline_stored_descriptions;
   if (!storage_writer_.InitializeShaderStorage(
           cache_root, title_id, pipeline_config,
-          // Shader load callback.
-          [&](xenos::ShaderType type, const uint32_t* ucode_dwords,
-              uint32_t ucode_dword_count, uint64_t ucode_data_hash) {
-            VulkanShader* shader =
-                LoadShader(type, ucode_dwords, ucode_dword_count);
-            if (!shader || shader->ucode_storage_index() == storage_index) {
-              return true;  // Continue reading.
-            }
-            shader->set_ucode_storage_index(storage_index);
-            if (!shader->is_ucode_analyzed()) {
-              shader->AnalyzeUcode(ucode_disasm_buffer_);
-            }
-            return true;
+          [this](xenos::ShaderType type, const uint32_t* ucode_dwords,
+                 uint32_t ucode_dword_count, uint64_t ucode_data_hash) {
+            return LoadShader(type, ucode_dwords, ucode_dword_count,
+                              ucode_data_hash);
           },
           // Shader translate callback - handles parallel translation.
           [this, edram_fsi_used](const std::set<std::pair<uint64_t, uint64_t>>

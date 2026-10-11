@@ -685,6 +685,9 @@ class MetalCommandProcessor : public CommandProcessor {
   // Rebuilds the stored pipelines.
   void CreateStoredPipelines(
       const std::vector<PipelineStoredDescription>& stored_descriptions);
+  SpirvShader* LoadShader(xenos::ShaderType shader_type,
+                          const uint32_t* host_address, uint32_t dword_count,
+                          uint64_t hash);
   // Queues the creation of a pipeline loaded from storage for
   // ReplayStoredPipelines. Returns nullptr with |vertex_shader_out| set, or why
   // it didn't.

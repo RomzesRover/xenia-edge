@@ -16,7 +16,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -430,11 +429,6 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
                           const uint32_t* host_address, uint32_t dword_count,
                           uint64_t data_hash);
 
-  // Analyzes shaders in parallel for storage loading. D3D12 renders only
-  // through spirv_to_dxil, so only the ucode analysis is needed here, ahead of
-  // the translations the pipeline creation runs.
-  void AnalyzeShadersForStorage(
-      const std::set<std::pair<uint64_t, uint64_t>>& translations_needed);
   // Queues the creation of a pipeline loaded from storage for
   // ReplayStoredPipelines. Returns nullptr with |vertex_shader_out| set, or why
   // it didn't.

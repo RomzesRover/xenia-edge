@@ -2164,6 +2164,11 @@ void MetalCommandProcessor::TranslateShadersForStorage(
     if (it == guest_shader_cache_.end()) {
       continue;
     }
+    // Translation needs the ucode analyzed, which the storage load did only for
+    // the shaders it read this time.
+    if (!it->second->is_ucode_analyzed()) {
+      it->second->AnalyzeUcode(ucode_disasm_buffer_);
+    }
     // A domain modification's SPIR-V is a tessellation evaluation module, which
     // the DXIL path cannot build as a standalone vertex function.
     // GetDxilTessellationShaders links it with the host stages instead.
@@ -2327,21 +2332,13 @@ void MetalCommandProcessor::InitializeShaderStorage(
   config.version = PipelineDescription::kVersion +
                    SpirvShaderTranslator::Modification::kVersion;
 
-  uint32_t storage_index = storage_writer_.storage_index() + 1;
   std::vector<PipelineStoredDescription> stored_descriptions;
   if (!storage_writer_.InitializeShaderStorage(
           cache_root, title_id, config,
-          [&](xenos::ShaderType type, const uint32_t* ucode_dwords,
-              uint32_t ucode_dword_count, uint64_t ucode_data_hash) {
-            Shader* shader = LoadShader(type, ucode_dwords, ucode_dword_count);
-            if (!shader || shader->ucode_storage_index() == storage_index) {
-              return true;
-            }
-            shader->set_ucode_storage_index(storage_index);
-            if (!shader->is_ucode_analyzed()) {
-              shader->AnalyzeUcode(ucode_disasm_buffer_);
-            }
-            return true;
+          [this](xenos::ShaderType type, const uint32_t* ucode_dwords,
+                 uint32_t ucode_dword_count, uint64_t ucode_data_hash) {
+            return LoadShader(type, ucode_dwords, ucode_dword_count,
+                              ucode_data_hash);
           },
           [this](const std::set<std::pair<uint64_t, uint64_t>>
                      & translations_needed) {
@@ -2929,8 +2926,14 @@ bool MetalCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
 Shader* MetalCommandProcessor::LoadShader(xenos::ShaderType shader_type,
                                           const uint32_t* host_address,
                                           uint32_t dword_count) {
-  uint64_t hash = XXH3_64bits(host_address, dword_count * sizeof(uint32_t));
+  return LoadShader(shader_type, host_address, dword_count,
+                    XXH3_64bits(host_address, dword_count * sizeof(uint32_t)));
+}
 
+SpirvShader* MetalCommandProcessor::LoadShader(xenos::ShaderType shader_type,
+                                               const uint32_t* host_address,
+                                               uint32_t dword_count,
+                                               uint64_t hash) {
   auto it = guest_shader_cache_.find(hash);
   if (it != guest_shader_cache_.end()) {
     return it->second.get();
