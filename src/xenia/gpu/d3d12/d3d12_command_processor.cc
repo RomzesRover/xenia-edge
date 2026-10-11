@@ -14,7 +14,6 @@
 
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
-#include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -2794,62 +2793,37 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   } else {
     bound_depth_and_color_render_target_bits = 0;
   }
-  // The ucode interpreter can rasterize a not-yet-translated vertex shader
-  // while its real shaders compile in the background (mirrors the Vulkan path).
-  // Eligible only for plain non-expanded vertex shaders with no textures /
-  // subroutines / memexport / loops, which the interpreter core handles.
-  bool use_interpreter =
-      cvars::async_shader_vs_interpreter &&
-      !vertex_shader_translation->is_translated() &&
-      active_vertex_shader_ucode_address() != 0 &&
-      primitive_processing_result.host_vertex_shader_type ==
-          Shader::HostVertexShaderType::kVertex &&
-      primitive_processing_result.host_primitive_type !=
-          xenos::PrimitiveType::kPointList &&
-      primitive_processing_result.host_primitive_type !=
-          xenos::PrimitiveType::kRectangleList &&
-      primitive_processing_result.host_primitive_type !=
-          xenos::PrimitiveType::kQuadList &&
-      vertex_shader->texture_bindings().empty() &&
-      !vertex_shader->uses_subroutine_calls() &&
-      vertex_shader->memexport_eM_written() == 0 &&
-      vertex_shader->constant_register_map().loop_bitmap == 0;
   // A skipped occlusion query draw counts nothing and gets what it tests
   // culled. A placeholder mostly overcounts as it skips the guest shader's
   // pixel kills. Surveys never count for a report.
   const bool skip_allowed = !active_segment_.report_measuring() || viz_survey;
+  AsyncPipelineDraw async_draw;
+  async_draw.async_available = pipeline_cache_->IsAsyncCreationAvailable();
+  async_draw.stand_in_allowed = stand_in_wait_reason == nullptr;
+  async_draw.skip_allowed = skip_allowed;
+  async_draw.has_pixel_shader = pixel_shader != nullptr;
+  async_draw.vertex_shader_translated =
+      vertex_shader_translation->is_translated();
+  async_draw.placeholder_supported = pipeline_cache_->IsPlaceholderSupported();
+  async_draw.interpreter_eligible = CanInterpretVertexShader(
+      *vertex_shader, active_vertex_shader_ucode_address(),
+      primitive_processing_result.host_vertex_shader_type,
+      primitive_processing_result.host_primitive_type);
+  const AsyncPipelinePlan async_plan = PlanAsyncPipeline(async_draw);
   void* pipeline_handle;
   ID3D12RootSignature* root_signature;
-  uint64_t inline_build_start = cvars::async_shader_compilation &&
-                                        stand_in_wait_reason &&
-                                        cvars::shader_profiling
-                                    ? xe::Clock::QueryHostTickCount()
-                                    : 0;
+  uint64_t inline_work_start = BeginInlinePipelineWork(stand_in_wait_reason);
   if (!pipeline_cache_->ConfigurePipeline(
           vertex_shader_translation, pixel_shader_translation,
           primitive_processing_result, normalized_depth_control,
           normalized_color_mask, apply_host_depth_polygon_offset, zpd_hybrid,
           viz_survey, bound_depth_and_color_render_target_bits,
-          bound_depth_and_color_render_target_formats, use_interpreter,
-          stand_in_wait_reason == nullptr, skip_allowed, &pipeline_handle,
-          &root_signature)) {
+          bound_depth_and_color_render_target_formats, async_plan,
+          &pipeline_handle, &root_signature)) {
     return false;
   }
-  if (inline_build_start) {
-    double inline_build_ms =
-        double(xe::Clock::QueryHostTickCount() - inline_build_start) * 1000.0 /
-        double(xe::Clock::QueryHostTickFrequency());
-    // A lookup takes microseconds. Anything slower translated shaders or built
-    // the pipeline.
-    if (inline_build_ms >= 1.0) {
-      XELOGI(
-          "shader_profiling: pipeline work inline for a draw into {} ({}): "
-          "VS {:016X}, PS {:016X}, {:.2f} ms",
-          render_target_cache_->GetLastUpdateDrawTargetName(),
-          stand_in_wait_reason, vertex_shader->ucode_data_hash(),
-          pixel_shader ? pixel_shader->ucode_data_hash() : 0, inline_build_ms);
-    }
-  }
+  EndInlinePipelineWork(inline_work_start, *render_target_cache_,
+                        stand_in_wait_reason, *vertex_shader, pixel_shader);
 
   if (cvars::async_shader_compilation) {
     bool hybrid_stand_in = false;
@@ -2875,41 +2849,23 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
               primitive_processing_result, normalized_depth_control,
               normalized_color_mask, apply_host_depth_polygon_offset, false,
               viz_survey, bound_depth_and_color_render_target_bits,
-              bound_depth_and_color_render_target_formats, use_interpreter,
-              stand_in_wait_reason == nullptr, skip_allowed, &pipeline_handle,
-              &root_signature)) {
+              bound_depth_and_color_render_target_formats, async_plan,
+              &pipeline_handle, &root_signature)) {
         return false;
       }
     }
   }
-  const char* wait_reason = stand_in_wait_reason;
-  if (!wait_reason && !skip_allowed &&
-      pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-    wait_reason = "occlusion query";
-  }
-  if (wait_reason &&
-      pipeline_cache_->IsPipelineCreationPending(pipeline_handle)) {
-    uint64_t await_start = xe::Clock::QueryHostTickCount();
-    pipeline_cache_->ExpeditePipeline(pipeline_handle);
-    XELOGI(
-        "Awaited real pipeline for a draw into {} ({}): VS {:016X}, PS "
-        "{:016X}, {:.2f} ms",
-        render_target_cache_->GetLastUpdateDrawTargetName(), wait_reason,
-        vertex_shader->ucode_data_hash(),
-        pixel_shader ? pixel_shader->ucode_data_hash() : 0,
-        double(xe::Clock::QueryHostTickCount() - await_start) * 1000.0 /
-            double(xe::Clock::QueryHostTickFrequency()));
-  }
-  if (pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
-    // No pipeline and no placeholder available (async_shader_skip_draws with
-    // no interpreter stand-in, bindful async, or a failed placeholder). Skip
-    // the draw until the real pipeline is ready.
-    XELOGI(
-        "Skipping draw - pipeline not ready: VS {:016X} mod {:016X}, PS "
-        "{:016X} mod {:016X}",
-        vertex_shader->ucode_data_hash(), vertex_shader_modification.value,
-        pixel_shader ? pixel_shader->ucode_data_hash() : 0,
-        pixel_shader_modification.value);
+  if (!AwaitDrawPipeline(
+          *render_target_cache_, stand_in_wait_reason, skip_allowed,
+          *vertex_shader, pixel_shader,
+          [&]() {
+            return pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) !=
+                   nullptr;
+          },
+          [&]() {
+            return pipeline_cache_->IsPipelineCreationPending(pipeline_handle);
+          },
+          [&]() { pipeline_cache_->ExpeditePipeline(pipeline_handle); })) {
     OnVIZSurveyDraw(false);
     return true;
   }

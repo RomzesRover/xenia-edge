@@ -27,6 +27,7 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/string_buffer.h"
 #include "xenia/base/threading.h"
+#include "xenia/gpu/async_pipeline.h"
 #include "xenia/gpu/d3d12/d3d12_render_target_cache.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/guest_spirv_shader_cache.h"
@@ -75,6 +76,13 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   bool IsStorageWarmUpRunning() const {
     return creation_queue_.IsAwaitingCompletion();
   }
+  // AsyncPipelineDraw::async_available.
+  bool IsAsyncCreationAvailable() const {
+    return cvars::async_shader_compilation && creation_queue_.has_threads();
+  }
+  // AsyncPipelineDraw::placeholder_supported. Placeholders are only made with
+  // bindless resources.
+  bool IsPlaceholderSupported() const { return bindless_resources_used_; }
 
   SpirvShader* LoadShader(xenos::ShaderType shader_type,
                           const uint32_t* host_address, uint32_t dword_count);
@@ -154,9 +162,8 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
       Shader::HostVertexShaderType host_vertex_shader_type);
 
   // If draw_util::IsRasterizationPotentiallyDone is false, the pixel shader
-  // MUST be made nullptr BEFORE calling this! Without skip_allowed, a draw with
-  // a pixel shader gets a placeholder even if its vertex shader has to be
-  // translated here for it.
+  // MUST be made nullptr BEFORE calling this! |async_plan| is followed for a
+  // pipeline that doesn't exist yet.
   bool ConfigurePipeline(
       Shader::Translation* vertex_shader, Shader::Translation* pixel_shader,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
@@ -165,8 +172,8 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
       bool zpd_total, bool viz_survey,
       uint32_t bound_depth_and_color_render_target_bits,
       const uint32_t* bound_depth_and_color_render_targets_formats,
-      bool use_interpreter, bool stand_in_allowed, bool skip_allowed,
-      void** pipeline_handle_out, ID3D12RootSignature** root_signature_out);
+      const AsyncPipelinePlan& async_plan, void** pipeline_handle_out,
+      ID3D12RootSignature** root_signature_out);
 
   // Returns a pipeline with deferred creation by its handle. May return nullptr
   // if failed to create the pipeline or still being created asynchronously.
@@ -379,10 +386,10 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     const std::vector<uint8_t>* mesa_pixel_dxil = nullptr;
     // Guest SPIR-V translations deferred to a creation thread: translated
     // (ucode->SPIR-V) and converted to DXIL there, off the main thread. Point
-    // into a SpirvShader's Translation in shaders_ (never erased). The
-    // live draw path defers only the pixel shader (the vertex DXIL is built
-    // synchronously for the placeholder). The storage warm-up defers both via
-    // mesa_vertex_translation, since there is no placeholder to satisfy.
+    // into a SpirvShader's Translation in shaders_ (never erased). A live
+    // draw with a real vertex shader placeholder defers only the pixel shader,
+    // its vertex DXIL built synchronously for the placeholder. The storage
+    // warm-up and the other live draws defer both via mesa_vertex_translation.
     Shader::Translation* mesa_vertex_translation = nullptr;
     Shader::Translation* mesa_pixel_translation = nullptr;
     // Mesa DXIL for the built-in geometry shader (primitive expansion). When

@@ -28,6 +28,7 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/threading.h"
 #include "xenia/base/xxhash.h"
+#include "xenia/gpu/async_pipeline.h"
 #include "xenia/gpu/guest_spirv_shader_cache.h"
 #include "xenia/gpu/pipeline_creation_queue.h"
 #include "xenia/gpu/primitive_processor.h"
@@ -145,6 +146,17 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   bool IsStorageWarmUpRunning() const {
     return creation_queue_.IsAwaitingCompletion();
   }
+  // AsyncPipelineDraw::async_available. Every async draw with a pixel shader
+  // needs the placeholder pixel shader.
+  bool IsAsyncCreationAvailable() const {
+    return cvars::async_shader_compilation && creation_queue_.has_threads() &&
+           placeholder_pixel_shader_ != VK_NULL_HANDLE;
+  }
+  // Whether the ucode interpreter vertex shader was created, for
+  // AsyncPipelineDraw::interpreter_eligible.
+  bool IsUcodeInterpreterAvailable() const {
+    return ucode_interpreter_vs_ != VK_NULL_HANDLE;
+  }
   // Stores a pipeline still being created without waiting for anything else
   // queued, for a draw that can't use a stand-in.
   void ExpeditePipeline(Pipeline* pipeline);
@@ -175,18 +187,16 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   bool EnsureShadersTranslated(VulkanShader::VulkanTranslation* vertex_shader,
                                VulkanShader::VulkanTranslation* pixel_shader,
                                SpirvShaderTranslator* translator = nullptr);
-  // use_interpreter requests the ucode interpreter VS placeholder for a new,
-  // untranslated vertex shader (falls back to normal translation if the async
-  // placeholder path can't be taken for this draw).
+  // |async_plan| is followed for a pipeline that doesn't exist yet.
   bool ConfigurePipeline(
       VulkanShader::VulkanTranslation* vertex_shader,
       VulkanShader::VulkanTranslation* pixel_shader,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask,
-      VulkanRenderTargetCache::RenderPassKey render_pass_key,
-      bool use_interpreter, bool zpd_total, bool viz_survey,
-      bool stand_in_allowed, Pipeline** pipeline_out);
+      VulkanRenderTargetCache::RenderPassKey render_pass_key, bool zpd_total,
+      bool viz_survey, const AsyncPipelinePlan& async_plan,
+      Pipeline** pipeline_out);
 
   // True while this draw must be fed the ucode interpreter's inputs (full float
   // constants + ucode location). False once hot-swapped to the real VS.
@@ -194,13 +204,6 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
     return pipeline->uses_interpreter.load(std::memory_order_acquire) &&
            pipeline->is_placeholder.load(std::memory_order_acquire);
   }
-
-  // Whether ConfigurePipeline can create the pipeline asynchronously (so the
-  // draw thread doesn't translate shaders itself). The use_async condition
-  // inside ConfigurePipeline, which also needs the draw to allow a stand-in.
-  // has_pixel_shader because without one the only stand-in is skipping the
-  // draw, which async_shader_skip_draws governs.
-  bool CanCreatePipelineAsync(bool has_pixel_shader) const;
 
  private:
   VulkanShader* LoadShader(xenos::ShaderType shader_type,

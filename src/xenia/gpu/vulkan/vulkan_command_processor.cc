@@ -15,7 +15,6 @@
 
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
-#include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
@@ -3511,7 +3510,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   SpirvShaderTranslator::Modification pixel_shader_modification;
   VulkanShader::VulkanTranslation* vertex_shader_translation;
   VulkanShader::VulkanTranslation* pixel_shader_translation;
-  bool use_interpreter = false;
+  AsyncPipelineDraw async_draw;
   uint32_t normalized_color_mask;
   reg::RB_DEPTHCONTROL normalized_depth_control;
   draw_util::HostDepthPolygonOffset host_depth_polygon_offset;
@@ -3615,57 +3614,37 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                            pixel_shader->GetOrCreateTranslation(
                                pixel_shader_modification.value))
                      : nullptr;
-    // Decide whether the ucode interpreter can stand in for the real VS while
-    // it translates+compiles in the background: a plain (non-tessellated,
-    // non-expanded) vertex shader with static control flow and no texture fetch
-    // or memory export, on a device matching the interpreter's assumptions
-    // (single shared-memory binding, full 32-bit indices). When eligible, VS
-    // translation is deferred to the background creation thread.
-    use_interpreter =
-        cvars::async_shader_vs_interpreter &&
-        !vertex_shader_translation->is_translated() &&
-        active_vertex_shader_ucode_address_ != 0 &&
+    // The interpreter additionally needs a single shared memory binding and
+    // full 32-bit indices.
+    async_draw.async_available = pipeline_cache_->IsAsyncCreationAvailable();
+    async_draw.skip_allowed = skip_allowed;
+    async_draw.has_pixel_shader = pixel_shader != nullptr;
+    async_draw.placeholder_supported = true;
+    async_draw.interpreter_eligible =
+        pipeline_cache_->IsUcodeInterpreterAvailable() &&
         device_properties.fullDrawIndexUint32 &&
         SpirvShaderTranslator::GetSharedMemoryStorageBufferCountLog2(
             device_properties.maxStorageBufferRange) == 0 &&
-        primitive_processing_result.host_vertex_shader_type ==
-            Shader::HostVertexShaderType::kVertex &&
-        primitive_processing_result.host_primitive_type !=
-            xenos::PrimitiveType::kPointList &&
-        primitive_processing_result.host_primitive_type !=
-            xenos::PrimitiveType::kRectangleList &&
-        primitive_processing_result.host_primitive_type !=
-            xenos::PrimitiveType::kQuadList &&
-        vertex_shader->texture_bindings().empty() &&
-        !vertex_shader->uses_subroutine_calls() &&
-        vertex_shader->memexport_eM_written() == 0 &&
-        vertex_shader->constant_register_map().loop_bitmap == 0;
-    bool async_available =
-        pipeline_cache_->CanCreatePipelineAsync(pixel_shader != nullptr);
-    // A draw with no placeholder to render it now: the interpreter can't stand
-    // in AND the real VS isn't translated yet (so no real-VS + no-op-PS
-    // placeholder either). These are the draws async_shader_skip_draws governs,
-    // as are draws without a pixel shader. Interpreter-eligible draws and draws
-    // whose VS is already translated have a placeholder when they have a pixel
-    // shader and never translate on the draw thread.
-    // Only decides whether to translate here. Whether the draw can render is
-    // read off the pipeline itself, which may have gained a placeholder since.
-    bool no_placeholder = async_available && !use_interpreter &&
-                          !vertex_shader_translation->is_translated();
-    // The draw thread translates only for a no-placeholder draw that isn't
-    // being skipped (so it can render via a real-VS placeholder).
-    bool translate_here =
-        !async_available || (no_placeholder && !cvars::async_shader_skip_draws);
-    // A draw that can't be skipped needs only its vertex shader for a real-VS
-    // placeholder.
-    bool translate_vertex_here =
-        !translate_here && no_placeholder && pixel_shader && !skip_allowed;
-    if (translate_here || translate_vertex_here) {
-      if (!pipeline_cache_->EnsureShadersTranslated(
-              vertex_shader_translation,
-              translate_here ? pixel_shader_translation : nullptr)) {
-        return false;
-      }
+        CanInterpretVertexShader(
+            *vertex_shader, active_vertex_shader_ucode_address_,
+            primitive_processing_result.host_vertex_shader_type,
+            primitive_processing_result.host_primitive_type);
+    // The shaders the draw's thread readies are translated now for their
+    // sampler bindings. Whether the draw can use a stand-in is known only once
+    // the render targets are updated, so this assumes it can unless the
+    // storage warm-up runs. ConfigurePipeline translates what a pipeline it
+    // creates now needs, and the draw is redone if that leaves samplers out.
+    async_draw.stand_in_allowed = !pipeline_cache_->IsStorageWarmUpRunning();
+    async_draw.vertex_shader_translated =
+        vertex_shader_translation->is_translated();
+    AsyncPipelinePlan translation_plan = PlanAsyncPipeline(async_draw);
+    if (translation_plan.vertex_shader_on_draw_thread &&
+        !pipeline_cache_->EnsureShadersTranslated(
+            vertex_shader_translation,
+            translation_plan.pixel_shader_on_draw_thread
+                ? pixel_shader_translation
+                : nullptr)) {
+      return false;
     }
 
     // Obtain the samplers. Note that the bindings don't depend on the shader
@@ -3688,7 +3667,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         continue;
       }
       // Don't read a shader's sampler bindings while a creation thread is still
-      // populating them (async draws don't translate here). If the bound
+      // populating them (an async draw leaves some shaders to it). If the bound
       // pipeline ends up running this shader the draw is redone below.
       if (!shader->bindings_ready()) {
         if (!i) {
@@ -3769,69 +3748,43 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // textures.
   VulkanRenderTargetCache::RenderPassKey render_pass_key =
       render_target_cache_->last_update_render_pass_key();
+  async_draw.stand_in_allowed = stand_in_wait_reason == nullptr;
+  async_draw.vertex_shader_translated =
+      vertex_shader_translation->is_translated();
+  const AsyncPipelinePlan async_plan = PlanAsyncPipeline(async_draw);
   VulkanPipelineCache::Pipeline* pipeline;
-  uint64_t inline_build_start = cvars::async_shader_compilation &&
-                                        stand_in_wait_reason &&
-                                        cvars::shader_profiling
-                                    ? xe::Clock::QueryHostTickCount()
-                                    : 0;
+  uint64_t inline_work_start = BeginInlinePipelineWork(stand_in_wait_reason);
   if (!pipeline_cache_->ConfigurePipeline(
           vertex_shader_translation, pixel_shader_translation,
           primitive_processing_result, normalized_depth_control,
-          normalized_color_mask, render_pass_key, use_interpreter, zpd_hybrid,
-          viz_survey, stand_in_wait_reason == nullptr, &pipeline)) {
+          normalized_color_mask, render_pass_key, zpd_hybrid, viz_survey,
+          async_plan, &pipeline)) {
     XELOGE("IssueDraw: ConfigurePipeline failed for VS={:016X} PS={:016X}",
            vertex_shader->ucode_data_hash(),
            pixel_shader ? pixel_shader->ucode_data_hash() : 0);
     return false;
   }
-  if (inline_build_start) {
-    double inline_build_ms =
-        double(xe::Clock::QueryHostTickCount() - inline_build_start) * 1000.0 /
-        double(xe::Clock::QueryHostTickFrequency());
-    // A lookup takes microseconds. Anything slower translated shaders or built
-    // the pipeline.
-    if (inline_build_ms >= 1.0) {
-      XELOGI(
-          "shader_profiling: pipeline work inline for a draw into {} ({}): "
-          "VS {:016X}, PS {:016X}, {:.2f} ms",
-          render_target_cache_->GetLastUpdateDrawTargetName(),
-          stand_in_wait_reason, vertex_shader->ucode_data_hash(),
-          pixel_shader ? pixel_shader->ucode_data_hash() : 0, inline_build_ms);
-    }
-  }
+  EndInlinePipelineWork(inline_work_start, *render_target_cache_,
+                        stand_in_wait_reason, *vertex_shader, pixel_shader);
 
   // If async mode is active, this may be a placeholder pipeline. The real
   // pipeline will be swapped in by the creation thread when ready.
-  VkPipeline current_pipeline =
-      pipeline->pipeline.load(std::memory_order_acquire);
-  const char* wait_reason = stand_in_wait_reason;
-  if (!wait_reason && !skip_allowed && current_pipeline == VK_NULL_HANDLE) {
-    wait_reason = "occlusion query";
-  }
-  if (wait_reason &&
-      pipeline->creation_pending.load(std::memory_order_acquire)) {
-    uint64_t await_start = xe::Clock::QueryHostTickCount();
-    pipeline_cache_->ExpeditePipeline(pipeline);
-    XELOGI(
-        "Awaited real pipeline for a draw into {} ({}): VS {:016X}, PS "
-        "{:016X}, {:.2f} ms",
-        render_target_cache_->GetLastUpdateDrawTargetName(), wait_reason,
-        vertex_shader->ucode_data_hash(),
-        pixel_shader ? pixel_shader->ucode_data_hash() : 0,
-        double(xe::Clock::QueryHostTickCount() - await_start) * 1000.0 /
-            double(xe::Clock::QueryHostTickFrequency()));
-    current_pipeline = pipeline->pipeline.load(std::memory_order_acquire);
-  }
-  if (current_pipeline == VK_NULL_HANDLE) {
-    // Nothing to draw with yet - no placeholder, real pipeline still building.
-    // Skip rather than stall, a later frame renders it.
-    XELOGI("Draw skipped (pipeline not ready yet): VS {:016X}, PS {:016X}",
-           vertex_shader->ucode_data_hash(),
-           pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+  if (!AwaitDrawPipeline(
+          *render_target_cache_, stand_in_wait_reason, skip_allowed,
+          *vertex_shader, pixel_shader,
+          [&]() {
+            return pipeline->pipeline.load(std::memory_order_acquire) !=
+                   VK_NULL_HANDLE;
+          },
+          [&]() {
+            return pipeline->creation_pending.load(std::memory_order_acquire);
+          },
+          [&]() { pipeline_cache_->ExpeditePipeline(pipeline); })) {
     OnVIZSurveyDraw(false);
     return true;
   }
+  VkPipeline current_pipeline =
+      pipeline->pipeline.load(std::memory_order_acquire);
   // Whether the placeholder pipeline is bound rather than the real one. Derived
   // from the handle actually bound so it stays consistent with current_pipeline
   // when a creation thread swaps in the real pipeline mid-draw.

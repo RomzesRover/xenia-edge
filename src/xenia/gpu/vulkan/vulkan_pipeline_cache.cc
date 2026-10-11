@@ -593,16 +593,6 @@ bool VulkanPipelineCache::EnsureShadersTranslated(
   return true;
 }
 
-bool VulkanPipelineCache::CanCreatePipelineAsync(bool has_pixel_shader) const {
-  // Nothing draws with a stand-in while the storage warm-up runs. Without a
-  // pixel shader the only stand-in is skipping the draw, which
-  // async_shader_skip_draws governs.
-  return cvars::async_shader_compilation && creation_queue_.has_threads() &&
-         (has_pixel_shader || cvars::async_shader_skip_draws) &&
-         placeholder_pixel_shader_ != VK_NULL_HANDLE &&
-         !IsStorageWarmUpRunning();
-}
-
 const VulkanPipelineCache::PipelineLayoutProvider*
 VulkanPipelineCache::GetGuestGraphicsPipelineLayout(
     const VulkanShader::VulkanTranslation* vertex_shader,
@@ -639,9 +629,9 @@ bool VulkanPipelineCache::ConfigurePipeline(
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     reg::RB_DEPTHCONTROL normalized_depth_control,
     uint32_t normalized_color_mask,
-    VulkanRenderTargetCache::RenderPassKey render_pass_key,
-    bool use_interpreter, bool zpd_total, bool viz_survey,
-    bool stand_in_allowed, VulkanPipelineCache::Pipeline** pipeline_out) {
+    VulkanRenderTargetCache::RenderPassKey render_pass_key, bool zpd_total,
+    bool viz_survey, const AsyncPipelinePlan& async_plan,
+    VulkanPipelineCache::Pipeline** pipeline_out) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -754,34 +744,23 @@ bool VulkanPipelineCache::ConfigurePipeline(
     }
   }
 
-  // Pipeline hot-swap: When async mode is enabled and we have creation threads,
-  // create a placeholder pipeline immediately (fast compile) for a draw with a
-  // pixel shader and queue the real pipeline creation in the background. This
-  // reduces stutter from pipeline compilation. A draw that can't use a
-  // stand-in gets its pipeline created here.
-  bool use_async =
-      CanCreatePipelineAsync(pixel_shader != nullptr) && stand_in_allowed;
-
-  // The interpreter can only stand in via the async placeholder path. There's
-  // no vertex-only placeholder as it would compile the real vertex shader all
-  // the same.
-  use_interpreter = use_interpreter && use_async && pixel_shader &&
-                    ucode_interpreter_vs_ != VK_NULL_HANDLE;
-
-  if (use_async) {
-    // The draw thread only translates for an async pipeline it expedites.
-    // Create an immediate placeholder when we can -
-    // the interpreter VS, or the real VS if it's already translated - and queue
-    // the real pipeline (translate + create) on a background thread. A
-    // non-interpretable draw whose shaders aren't translated yet, or one
-    // without a pixel shader, gets NO placeholder. The caller skips it until
-    // the real pipeline is ready. The pipeline layout starts minimal (0 texture
-    // counts from untranslated shaders) and is upgraded to the real one on the
-    // creation thread.
+  // A pipeline that doesn't exist yet follows the plan.
+  if (async_plan.async) {
+    // Create the stand-in placeholder now and queue the real pipeline
+    // (translate + create) on a creation thread. Without a placeholder the
+    // caller skips the draw until the real pipeline is ready. The pipeline
+    // layout starts minimal (0 texture counts from untranslated shaders) and is
+    // upgraded to the real one on the creation thread.
+    bool use_interpreter =
+        async_plan.stand_in == AsyncPipelinePlan::StandIn::kInterpreter;
     pipeline_pair.second.uses_interpreter.store(use_interpreter,
                                                 std::memory_order_release);
+    // The real vertex shader stands in only if it was translated before the
+    // layout was picked.
     bool make_placeholder =
-        pixel_shader && (use_interpreter || vertex_shader_translated);
+        use_interpreter ||
+        (async_plan.stand_in == AsyncPipelinePlan::StandIn::kRealVertexShader &&
+         vertex_shader_translated);
     if (make_placeholder) {
       // Set is_placeholder BEFORE creating the pipeline to avoid a race with
       // the creation thread checking this flag.
@@ -911,11 +890,9 @@ VkPipeline VulkanPipelineCache::CreateQueuedPipeline(
                                worker_translator)) {
     failed_stage = "shader translation";
   } else {
-    // Async pipelines are created with a minimal (no-texture) layout on the
-    // draw thread since their shaders weren't translated there (interpreter
-    // placeholder, or drop-until-ready with no placeholder). Now that they're
-    // translated, compute the real layout before creating the real pipeline.
-    // Idempotent when the layout was already real (real-VS placeholder path).
+    // An async pipeline's layout was picked on the draw thread from the
+    // shaders translated by then, which may not be all of them. Now that they
+    // are, compute the real layout before creating the real pipeline.
     const PipelineLayoutProvider* real_layout = GetGuestGraphicsPipelineLayout(
         creation_arguments.vertex_shader, creation_arguments.pixel_shader);
     if (real_layout) {
