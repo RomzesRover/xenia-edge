@@ -1081,8 +1081,8 @@ class Shader {
         expected, new_index, std::memory_order_relaxed);
   }
 
-  // Whether a draw has used this vertex shader, in this session or in one whose
-  // storage was loaded.
+  // Whether a draw has used this vertex shader, or the storage warm-up builds a
+  // pipeline with it.
   bool is_drawn() const { return is_drawn_; }
   void set_drawn() { is_drawn_ = true; }
 

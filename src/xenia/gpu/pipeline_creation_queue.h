@@ -41,8 +41,8 @@ class PipelineCreationQueue {
  public:
   using Publication = std::pair<TRequest, THandle>;
   // Creates one pipeline, returning a null handle if it failed. Runs on a
-  // creation thread with that thread's context, or on the thread expediting
-  // the request with its own.
+  // creation thread with that thread's context, or with its own on the thread
+  // expediting the request or finishing a warm-up.
   using Creator = std::function<THandle(const TRequest&, TThreadContext*)>;
   // Swaps a created pipeline - or a failure, a null handle - into its entry.
   // Called in queue order unless expedited, under the publish order's lock
@@ -56,8 +56,8 @@ class PipelineCreationQueue {
   using BusyChanged = std::function<void(bool)>;
 
   // Reports pipeline work done outside the queue, such as a pipeline created on
-  // the draw thread, through BusyChanged while it lasts. AwaitCompletion
-  // ignores it.
+  // the draw thread, through BusyChanged while it lasts. FinishWarmUp ignores
+  // it.
   class BusyScope {
    public:
     explicit BusyScope(PipelineCreationQueue& owner) : owner_(owner) {
@@ -71,8 +71,8 @@ class PipelineCreationQueue {
     PipelineCreationQueue& owner_;
   };
 
-  // Prepares the queue. Call it even with no creation threads - the storage
-  // warm-up may start some later.
+  // Prepares the queue. Call it even with no creation threads, as the storage
+  // warm-up goes through it all the same.
   void Initialize(const char* thread_name, Creator creator, Store store,
                   ContextFactory context_factory, BusyChanged busy_changed) {
     thread_name_ = thread_name;
@@ -115,7 +115,6 @@ class PipelineCreationQueue {
   }
 
   bool has_threads() const { return !threads_.empty(); }
-  size_t thread_count() const { return threads_.size(); }
 
   // Grows or shrinks the pool. Shrink with the queue drained - a thread only
   // leaves between requests, so anything still queued would be stranded.
@@ -159,49 +158,23 @@ class PipelineCreationQueue {
   // Wakes a creation thread without waiting for it.
   void Notify() { cond_.notify_one(); }
 
-  // Blocks until everything queued has been created.
-  void AwaitCompletion() {
-    if (threads_.empty()) {
+  // Finishes a storage warm-up queued with PushUnordered. When blocking, or
+  // with no creation threads to leave it to, it's created here with |context|.
+  // Otherwise |completion_callback| is taken to be invoked once everything
+  // queued is created, and left with the caller if that already is.
+  void FinishWarmUp(bool blocking, TThreadContext* context,
+                    std::function<void()>& completion_callback) {
+    if (blocking || threads_.empty()) {
+      DrainOnCallingThread(context);
+      AwaitCompletion();
       return;
     }
-    bool await;
-    {
-      std::lock_guard<std::mutex> lock(lock_);
-      await = IsBusyLocked();
-      if (await) {
-        completion_event_->Reset();
-        completion_set_event_ = true;
-      }
-    }
-    if (await) {
-      cond_.notify_one();
-      xe::threading::Wait(completion_event_.get(), false);
-    }
+    TakeCompletionCallback(completion_callback);
   }
 
-  // Takes the callback to invoke when everything queued has been created, and
-  // leaves it with the caller if there is nothing to wait for.
-  void TakeCompletionCallback(std::function<void()>& callback) {
-    std::lock_guard<std::mutex> lock(lock_);
-    if (!IsBusyLocked()) {
-      return;
-    }
-    completion_callback_ = std::move(callback);
-    callback = nullptr;
-    awaiting_completion_.store(true, std::memory_order_release);
-  }
-
-  // Whether TakeCompletionCallback is still waiting for everything queued to
-  // be created.
+  // Whether FinishWarmUp is still waiting for everything queued to be created.
   bool IsAwaitingCompletion() const {
     return awaiting_completion_.load(std::memory_order_acquire);
-  }
-
-  // Creates whatever is queued on the calling thread, with a context of its
-  // own. For the storage warm-up, which has a thread to spare.
-  void DrainOnCallingThread(TThreadContext* context) {
-    while (CreateOneQueued(context)) {
-    }
   }
 
   // Stores the request |match| picks without waiting for anything queued
@@ -246,6 +219,45 @@ class PipelineCreationQueue {
   };
 
   bool IsBusyLocked() const { return !queue_.empty() || threads_busy_ != 0; }
+
+  // Blocks until everything queued has been created.
+  void AwaitCompletion() {
+    if (threads_.empty()) {
+      return;
+    }
+    bool await;
+    {
+      std::lock_guard<std::mutex> lock(lock_);
+      await = IsBusyLocked();
+      if (await) {
+        completion_event_->Reset();
+        completion_set_event_ = true;
+      }
+    }
+    if (await) {
+      cond_.notify_one();
+      xe::threading::Wait(completion_event_.get(), false);
+    }
+  }
+
+  // Takes the callback to invoke when everything queued has been created, and
+  // leaves it with the caller if there is nothing to wait for.
+  void TakeCompletionCallback(std::function<void()>& callback) {
+    std::lock_guard<std::mutex> lock(lock_);
+    if (!IsBusyLocked()) {
+      return;
+    }
+    completion_callback_ = std::move(callback);
+    callback = nullptr;
+    awaiting_completion_.store(true, std::memory_order_release);
+  }
+
+  // Creates whatever is queued on the calling thread, with a context of its
+  // own.
+  void DrainOnCallingThread(TThreadContext* context) {
+    while (CreateOneQueued(context)) {
+    }
+  }
 
   void AddOutsideWork(int delta) {
     std::lock_guard<std::mutex> lock(lock_);

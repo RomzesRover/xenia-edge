@@ -432,9 +432,15 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
 
   // Analyzes shaders in parallel for storage loading. D3D12 renders only
   // through spirv_to_dxil, so only the ucode analysis is needed here, ahead of
-  // the translations the creation threads run.
+  // the translations the pipeline creation runs.
   void AnalyzeShadersForStorage(
       const std::set<std::pair<uint64_t, uint64_t>>& translations_needed);
+  // Queues the creation of a pipeline loaded from storage for
+  // ReplayStoredPipelines. Returns nullptr with |vertex_shader_out| set, or why
+  // it didn't.
+  const char* QueueStoredPipeline(
+      const PipelineStoredDescription& pipeline_stored_description,
+      Shader*& vertex_shader_out);
 
   // Builds the Mesa DXIL (vertex/domain + tessellation host shaders + pixel +
   // built-in geometry) for a pipeline being rebuilt from storage and fills the
@@ -442,8 +448,9 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   // SpirvShader translation objects must already exist (created on the main
   // thread via EnsureGuestMesaSpirvTranslation). The ucode->SPIR-V translation
   // and SPIR-V->DXIL conversion run on the given translator's thread, so this
-  // is called on a creation thread for the warm-up. Returns false on any
-  // translation failure.
+  // is called on a creation thread for the warm-up, or on the processor thread
+  // when FinishWarmUp drains it there. Returns false on any translation
+  // failure.
   bool BuildMesaPipelineDxil(Shader::Translation* vertex_translation,
                              Shader::Translation* pixel_translation,
                              SpirvShaderTranslator& translator,
@@ -580,9 +587,9 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     // rebuild, which is what limits it to one attempt. A live pipeline that
     // fails is a real failure and is never retried.
     bool from_storage{false};
-    // Set by a creation thread when real creation failed. A warm-up build that
-    // ran before its shaders finished translating has no DXIL to create from,
-    // and the entry would otherwise skip its draws for the rest of the session.
+    // Set when real creation failed. A warm-up build that ran before its
+    // shaders finished translating has no DXIL to create from, and the entry
+    // would otherwise skip its draws for the rest of the session.
     std::atomic<bool> creation_failed{false};
     // Set while the entry is in the creation queue, cleared once its result,
     // real or failed, is stored.
@@ -595,7 +602,8 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   };
 
   // Builds the deferred DXIL for a pipeline on the calling thread (a creation
-  // thread, or the processor thread in blocking mode or when expediting).
+  // thread, or the processor thread when expediting or when FinishWarmUp
+  // creates the storage warm-up there).
   // Storage warm-up pipelines defer the whole build. Live async pipelines defer
   // only the pixel shader. The translation runs on mesa_spirv_translator, the
   // calling thread's own.

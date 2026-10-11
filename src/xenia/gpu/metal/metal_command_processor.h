@@ -682,9 +682,14 @@ class MetalCommandProcessor : public CommandProcessor {
   // Turns the stored (ucode hash, modification) pairs into compiled shaders.
   void TranslateShadersForStorage(
       const std::set<std::pair<uint64_t, uint64_t>>& translations_needed);
-  // Rebuilds the stored pipelines. Returns how many were created.
-  size_t CreateStoredPipelines(
+  // Rebuilds the stored pipelines.
+  void CreateStoredPipelines(
       const std::vector<PipelineStoredDescription>& stored_descriptions);
+  // Queues the creation of a pipeline loaded from storage for
+  // ReplayStoredPipelines. Returns nullptr with |vertex_shader_out| set, or why
+  // it didn't.
+  const char* QueueStoredPipeline(const PipelineStoredDescription& stored,
+                                  Shader*& vertex_shader_out);
   std::unordered_map<uint64_t, MTL::RenderPipelineState*> async_pipeline_cache_;
 
   // SPIRV-Cross tessellation support.

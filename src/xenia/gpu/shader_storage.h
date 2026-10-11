@@ -10,6 +10,7 @@
 #ifndef XENIA_GPU_SHADER_STORAGE_H_
 #define XENIA_GPU_SHADER_STORAGE_H_
 
+#include <algorithm>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -19,11 +20,15 @@
 #include <functional>
 #include <mutex>
 #include <set>
+#include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
@@ -559,6 +564,57 @@ class ShaderStorageWriter {
   bool storage_write_flush_pipelines_ = false;
   bool storage_write_thread_shutdown_ = false;
 };
+
+// Hands each pipeline description loaded from storage to |queue_stored|, which
+// either queues the pipeline's creation, setting its Shader*& argument to the
+// vertex shader, and returns nullptr, or returns why it didn't. Logs the
+// outcome and returns how many were queued.
+template <typename TPipelineStoredDescription, typename QueueStored>
+size_t ReplayStoredPipelines(
+    const std::vector<TPipelineStoredDescription>& stored_descriptions,
+    QueueStored&& queue_stored) {
+  if (stored_descriptions.empty()) {
+    return 0;
+  }
+  uint64_t start_ticks = xe::Clock::QueryHostTickCount();
+  size_t queued_count = 0;
+  std::vector<std::pair<std::string_view, size_t>> skip_counts;
+  for (const TPipelineStoredDescription& stored_description :
+       stored_descriptions) {
+    Shader* vertex_shader = nullptr;
+    const char* skip_reason = queue_stored(stored_description, vertex_shader);
+    if (skip_reason) {
+      auto skip_it = std::find_if(skip_counts.begin(), skip_counts.end(),
+                                  [&](const auto& skip_count) {
+                                    return skip_count.first == skip_reason;
+                                  });
+      if (skip_it != skip_counts.end()) {
+        ++skip_it->second;
+      } else {
+        skip_counts.emplace_back(skip_reason, 1);
+      }
+      continue;
+    }
+    // Stored shaders count as drawn only with a pipeline queued for them here,
+    // which those only another backend or render target path drew lack.
+    vertex_shader->set_drawn();
+    ++queued_count;
+  }
+  std::string skipped;
+  for (const auto& [skip_reason, count] : skip_counts) {
+    skipped += fmt::format("{}{} {}", skipped.empty() ? " (" : ", ", count,
+                           skip_reason);
+  }
+  if (!skipped.empty()) {
+    skipped += ')';
+  }
+  XELOGI("Pipeline storage: {} of {} stored pipelines queued in {} ms{}",
+         queued_count, stored_descriptions.size(),
+         (xe::Clock::QueryHostTickCount() - start_ticks) * 1000 /
+             xe::Clock::QueryHostTickFrequency(),
+         skipped);
+  return queued_count;
+}
 
 }  // namespace gpu
 }  // namespace xe

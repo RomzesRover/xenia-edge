@@ -373,6 +373,12 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   void TranslateShadersForStorage(
       const std::set<std::pair<uint64_t, uint64_t>>& translations_needed,
       bool edram_fsi_used);
+  // Queues the creation of a pipeline loaded from storage for
+  // ReplayStoredPipelines. Returns nullptr with |vertex_shader_out| set, or why
+  // it didn't.
+  const char* QueueStoredPipeline(
+      const PipelineStoredDescription& pipeline_stored_description,
+      Shader*& vertex_shader_out);
 
   // Guest graphics pipeline layout for the given (translated) shaders. Binding
   // counts come from translation, so untranslated shaders yield the minimal
@@ -567,13 +573,13 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   // Previously used pipeline, to avoid lookups if the state wasn't changed.
   std::pair<const PipelineDescription, Pipeline>* last_pipeline_ = nullptr;
 
-  // Builds one queued pipeline on a creation thread or the thread expediting
-  // it. VK_NULL_HANDLE if it failed.
+  // Builds one queued pipeline on a creation thread, the thread expediting it
+  // or the one finishing a warm-up. VK_NULL_HANDLE if it failed.
   VkPipeline CreateQueuedPipeline(
       const PipelineCreationArguments& creation_arguments,
       SpirvShaderTranslator* worker_translator);
 
-  // For asynchronous creation.
+  // For queued creation.
   using CreationQueue =
       PipelineCreationQueue<PipelineCreationArguments, VkPipeline,
                             SpirvShaderTranslator>;

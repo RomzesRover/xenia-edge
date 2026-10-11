@@ -2187,13 +2187,9 @@ void MetalCommandProcessor::TranslateShadersForStorage(
   }
 }
 
-size_t MetalCommandProcessor::CreateStoredPipelines(
+void MetalCommandProcessor::CreateStoredPipelines(
     const std::vector<PipelineStoredDescription>& stored_descriptions) {
   replaying_stored_pipelines_ = true;
-  size_t created = 0;
-  size_t skipped_shader = 0;
-  size_t skipped_tessellation = 0;
-  size_t skipped_other_path = 0;
 
   // Ask for every tessellation stage set first, so the one drain below covers
   // them all rather than one per description.
@@ -2220,88 +2216,84 @@ size_t MetalCommandProcessor::CreateStoredPipelines(
     AwaitAsyncCompiles();
   }
 
-  for (const PipelineStoredDescription& stored : stored_descriptions) {
-    const PipelineDescription& description = stored.description;
-    // A tessellation pipeline belongs to the path that recorded it, and its
-    // shaders are the wrong subclass for the other one.
-    if (IsTessellationPipelineKind(PipelineKind(description.kind)) &&
-        (PipelineKind(description.kind) == PipelineKind::kDxilTessellation) !=
-            UseDxilPath()) {
-      ++skipped_other_path;
-      continue;
-    }
-    auto vertex_it = guest_shader_cache_.find(description.vertex_shader_hash);
-    if (vertex_it == guest_shader_cache_.end()) {
-      ++skipped_shader;
-      continue;
-    }
-    ShaderCompileStatus status = ShaderCompileStatus::kReady;
-    Shader::Translation* pixel_translation = nullptr;
-    if (description.pixel_shader_hash) {
-      auto pixel_it = guest_shader_cache_.find(description.pixel_shader_hash);
-      if (pixel_it == guest_shader_cache_.end()) {
-        ++skipped_shader;
-        continue;
-      }
-      pixel_translation = GetOrCreateHostTranslation(
-          *pixel_it->second, description.pixel_shader_modification,
-          /*allow_async=*/false, &status);
-      if (status != ShaderCompileStatus::kReady) {
-        ++skipped_shader;
-        continue;
-      }
-    }
-
-    // The description is the key, so a rebuilt pipeline lands exactly where the
-    // draw that stored it will look for it.
-    PipelineCompileRequest request = {};
-    request.description = description;
-    request.pipeline_key = description.GetHash();
-    request.priority = pixel_translation ? 2 : 1;
-    if (PipelineKind(description.kind) == PipelineKind::kDxilTessellation) {
-      // The domain modification never becomes a standalone vertex function, so
-      // it is asked for through the linked stages rather than translated here.
-      const DxilTessellationShaders* shaders = GetDxilTessellationShaders(
-          *static_cast<DxilShader*>(vertex_it->second.get()),
-          description.vertex_shader_modification, description.tessellation_mode,
-          description.host_vertex_shader_type, /*allow_async=*/true, &status);
-      if (!shaders) {
-        ++skipped_tessellation;
-        continue;
-      }
-      request.tessellation_shaders = shaders;
-      if (pixel_translation) {
-        auto* dxil_pixel =
-            static_cast<DxilShader::DxilTranslation*>(pixel_translation);
-        request.fragment_library = dxil_pixel->metal_library();
-        request.fragment_function_name = dxil_pixel->entry_point_name();
-      }
-    } else {
-      Shader::Translation* vertex_translation = GetOrCreateHostTranslation(
-          *vertex_it->second, description.vertex_shader_modification,
-          /*allow_async=*/false, &status);
-      if (status != ShaderCompileStatus::kReady) {
-        ++skipped_shader;
-        continue;
-      }
-      request.vertex_function = GetHostShaderFunction(vertex_translation);
-      request.fragment_function = GetHostShaderFunction(pixel_translation);
-    }
-
-    PipelineCompileStatus pipeline_status = PipelineCompileStatus::kFailed;
-    AcquirePipelineState(request, /*allow_async=*/true, &pipeline_status);
-    if (pipeline_status != PipelineCompileStatus::kFailed) {
-      ++created;
-    }
-  }
+  ReplayStoredPipelines(stored_descriptions,
+                        [this](const PipelineStoredDescription& stored,
+                               Shader*& vertex_shader_out) {
+                          return QueueStoredPipeline(stored, vertex_shader_out);
+                        });
   replaying_stored_pipelines_ = false;
-  if (skipped_shader || skipped_tessellation || skipped_other_path) {
-    XELOGI(
-        "Metal pipeline storage: skipped {} for missing or unbuildable "
-        "shaders, {} for tessellation stages, {} belonging to the other path",
-        skipped_shader, skipped_tessellation, skipped_other_path);
+}
+
+const char* MetalCommandProcessor::QueueStoredPipeline(
+    const PipelineStoredDescription& stored, Shader*& vertex_shader_out) {
+  const PipelineDescription& description = stored.description;
+  // A tessellation pipeline belongs to the path that recorded it, and its
+  // shaders are the wrong subclass for the other one.
+  if (IsTessellationPipelineKind(PipelineKind(description.kind)) &&
+      (PipelineKind(description.kind) == PipelineKind::kDxilTessellation) !=
+          UseDxilPath()) {
+    return "belonging to the other path";
   }
-  return created;
+  auto vertex_it = guest_shader_cache_.find(description.vertex_shader_hash);
+  if (vertex_it == guest_shader_cache_.end()) {
+    return "VS not found";
+  }
+  ShaderCompileStatus status = ShaderCompileStatus::kReady;
+  Shader::Translation* pixel_translation = nullptr;
+  if (description.pixel_shader_hash) {
+    auto pixel_it = guest_shader_cache_.find(description.pixel_shader_hash);
+    if (pixel_it == guest_shader_cache_.end()) {
+      return "PS not found";
+    }
+    pixel_translation = GetOrCreateHostTranslation(
+        *pixel_it->second, description.pixel_shader_modification,
+        /*allow_async=*/false, &status);
+    if (status != ShaderCompileStatus::kReady) {
+      return "PS not buildable";
+    }
+  }
+
+  // The description is the key, so a rebuilt pipeline lands exactly where the
+  // draw that stored it will look for it.
+  PipelineCompileRequest request = {};
+  request.description = description;
+  request.pipeline_key = description.GetHash();
+  request.priority = pixel_translation ? 2 : 1;
+  if (PipelineKind(description.kind) == PipelineKind::kDxilTessellation) {
+    // The domain modification never becomes a standalone vertex function, so
+    // it is asked for through the linked stages rather than translated here.
+    const DxilTessellationShaders* shaders = GetDxilTessellationShaders(
+        *static_cast<DxilShader*>(vertex_it->second.get()),
+        description.vertex_shader_modification, description.tessellation_mode,
+        description.host_vertex_shader_type, /*allow_async=*/true, &status);
+    if (!shaders) {
+      return "tessellation stages failed";
+    }
+    request.tessellation_shaders = shaders;
+    if (pixel_translation) {
+      auto* dxil_pixel =
+          static_cast<DxilShader::DxilTranslation*>(pixel_translation);
+      request.fragment_library = dxil_pixel->metal_library();
+      request.fragment_function_name = dxil_pixel->entry_point_name();
+    }
+  } else {
+    Shader::Translation* vertex_translation = GetOrCreateHostTranslation(
+        *vertex_it->second, description.vertex_shader_modification,
+        /*allow_async=*/false, &status);
+    if (status != ShaderCompileStatus::kReady) {
+      return "VS not buildable";
+    }
+    request.vertex_function = GetHostShaderFunction(vertex_translation);
+    request.fragment_function = GetHostShaderFunction(pixel_translation);
+  }
+
+  PipelineCompileStatus pipeline_status = PipelineCompileStatus::kFailed;
+  AcquirePipelineState(request, /*allow_async=*/true, &pipeline_status);
+  if (pipeline_status == PipelineCompileStatus::kFailed) {
+    return "pipeline failed";
+  }
+  vertex_shader_out = vertex_it->second.get();
+  return nullptr;
 }
 
 void MetalCommandProcessor::InitializeShaderStorage(
@@ -2364,19 +2356,17 @@ void MetalCommandProcessor::InitializeShaderStorage(
   }
 
   uint64_t start_ticks = xe::Clock::QueryHostTickCount();
-  size_t accepted = CreateStoredPipelines(stored_descriptions);
+  CreateStoredPipelines(stored_descriptions);
   if (blocking) {
     // The caller is waiting on this, so finish rather than leaving the compile
     // threads to race the guest's first draws.
     AwaitAsyncCompiles();
   }
-  XELOGI(
-      "Metal pipeline storage: {} of {} stored pipelines {} in {} ms ({} path)",
-      accepted, stored_descriptions.size(),
-      blocking ? "rebuilt" : "rebuilt or queued",
-      (xe::Clock::QueryHostTickCount() - start_ticks) * 1000 /
-          xe::Clock::QueryHostTickFrequency(),
-      UseDxilPath() ? "DXIL" : "SPIRV-Cross");
+  XELOGI("Metal pipeline storage: {} path, stored pipelines {} in {} ms",
+         UseDxilPath() ? "DXIL" : "SPIRV-Cross",
+         blocking ? "rebuilt" : "rebuilt or queued",
+         (xe::Clock::QueryHostTickCount() - start_ticks) * 1000 /
+             xe::Clock::QueryHostTickFrequency());
 
   if (completion_callback) {
     completion_callback();
