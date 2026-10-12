@@ -26,6 +26,7 @@ using xe::kernel::xboxkrnl::XECRYPT_DES_STATE;
 using xe::kernel::xboxkrnl::XeCryptDes3Cbc;
 using xe::kernel::xboxkrnl::XeCryptDes3Ecb;
 using xe::kernel::xboxkrnl::XeCryptDes3Key;
+using xe::kernel::xboxkrnl::XeCryptDesCbc;
 using xe::kernel::xboxkrnl::XeCryptDesEcb;
 using xe::kernel::xboxkrnl::XeCryptDesKey;
 using xe::kernel::xboxkrnl::XeCryptDesParity;
@@ -56,6 +57,30 @@ TEST_CASE("XeCryptDesEcb_known_answer", "[crypt]") {
   REQUIRE(block == FromHex("85E813540F0AB405"));
   XeCryptDesEcb(&state, block.data(), block.data(), false);
   REQUIRE(block == FromHex("0123456789ABCDEF"));
+}
+
+TEST_CASE("XeCryptDesCbc_updates_feed_and_skips_partial_block", "[crypt]") {
+  // FIPS 81 CBC example.
+  XECRYPT_DES_STATE state;
+  XeCryptDesKey(&state, FromHex("0123456789ABCDEF").data());
+  const Bytes iv = FromHex("1234567890ABCDEF");
+  const std::string_view plaintext = "Now is the time for all ";
+  const Bytes ciphertext =
+      FromHex("E5C7CDDE872BF27C43E934008C389C0F683788499A7C05F6");
+
+  Bytes data(plaintext.begin(), plaintext.end());
+  data.resize(28, 0xCC);
+  Bytes feed = iv;
+  XeCryptDesCbc(&state, data.data(), 28, data.data(), feed.data(), true);
+  REQUIRE(std::equal(ciphertext.begin(), ciphertext.end(), data.begin()));
+  REQUIRE(std::all_of(data.begin() + 24, data.end(),
+                      [](uint8_t b) { return b == 0xCC; }));
+  REQUIRE(feed == FromHex("683788499A7C05F6"));
+
+  feed = iv;
+  XeCryptDesCbc(&state, data.data(), 24, data.data(), feed.data(), false);
+  REQUIRE(std::equal(plaintext.begin(), plaintext.end(), data.begin()));
+  REQUIRE(feed == FromHex("683788499A7C05F6"));
 }
 
 TEST_CASE("XeCryptDes3Ecb_known_answer", "[crypt]") {
