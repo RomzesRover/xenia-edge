@@ -134,3 +134,6 @@
 	path = third_party/mesa
 	url = https://gitlab.freedesktop.org/has207/mesa.git
 	ignore = dirty
+[submodule "third_party/mbedtls"]
+	path = third_party/mbedtls
+	url = https://github.com/Mbed-TLS/mbedtls.git
