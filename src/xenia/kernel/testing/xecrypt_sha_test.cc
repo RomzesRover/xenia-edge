@@ -22,17 +22,22 @@
 namespace {
 
 using xe::kernel::xboxkrnl::XECRYPT_SHA256_STATE;
+using xe::kernel::xboxkrnl::XECRYPT_SHA512_STATE;
 using xe::kernel::xboxkrnl::XECRYPT_SHA_STATE;
 using xe::kernel::xboxkrnl::XeCryptSha;
 using xe::kernel::xboxkrnl::XeCryptSha256Final;
 using xe::kernel::xboxkrnl::XeCryptSha256Init;
 using xe::kernel::xboxkrnl::XeCryptSha256Update;
+using xe::kernel::xboxkrnl::XeCryptSha512Final;
+using xe::kernel::xboxkrnl::XeCryptSha512Init;
+using xe::kernel::xboxkrnl::XeCryptSha512Update;
 using xe::kernel::xboxkrnl::XeCryptShaFinal;
 using xe::kernel::xboxkrnl::XeCryptShaInit;
 using xe::kernel::xboxkrnl::XeCryptShaUpdate;
 
 using Digest = std::array<uint8_t, 20>;
 using Digest256 = std::array<uint8_t, 32>;
+using Digest512 = std::array<uint8_t, 64>;
 
 template <typename T = Digest>
 T FromHex(std::string_view hex) {
@@ -59,6 +64,21 @@ Digest Final(XECRYPT_SHA_STATE& state) {
   Digest digest;
   XeCryptShaFinal(&state, digest.data(), static_cast<uint32_t>(digest.size()));
   return digest;
+}
+
+Digest512 Final512(XECRYPT_SHA512_STATE& state) {
+  Digest512 digest;
+  XeCryptSha512Final(&state, digest.data(),
+                     static_cast<uint32_t>(digest.size()));
+  return digest;
+}
+
+Digest512 Sha512(std::string_view message) {
+  XECRYPT_SHA512_STATE state;
+  XeCryptSha512Init(&state);
+  XeCryptSha512Update(&state, Bytes(message),
+                      static_cast<uint32_t>(message.size()));
+  return Final512(state);
 }
 
 Digest256 Sha256(std::string_view message) {
@@ -196,6 +216,58 @@ TEST_CASE("XeCryptSha256Final_copies_digest_to_buffer", "[crypt]") {
   Digest256 digest;
   XeCryptSha256Final(&state, digest.data(),
                      static_cast<uint32_t>(digest.size()));
+
+  REQUIRE(state.count == 3);
+  REQUIRE(std::memcmp(state.state, before.state, sizeof(state.state)) == 0);
+  REQUIRE(std::memcmp(state.buffer, digest.data(), digest.size()) == 0);
+}
+
+TEST_CASE("XeCryptSha512_known_answers", "[crypt]") {
+  REQUIRE(
+      Sha512("") ==
+      FromHex<Digest512>(
+          "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce"
+          "47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"));
+  REQUIRE(
+      Sha512("abc") ==
+      FromHex<Digest512>(
+          "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+          "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"));
+  REQUIRE(
+      Sha512("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijkl"
+             "mnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu") ==
+      FromHex<Digest512>(
+          "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018"
+          "501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909"));
+}
+
+TEST_CASE("XeCryptSha512Update_streams_across_blocks", "[crypt]") {
+  const std::vector<uint8_t> message(1000000, 'a');
+  XECRYPT_SHA512_STATE state;
+  XeCryptSha512Init(&state);
+  size_t offset = 0;
+  size_t chunk = 1;
+  while (offset < message.size()) {
+    const size_t size = std::min(chunk, message.size() - offset);
+    XeCryptSha512Update(&state, message.data() + offset,
+                        static_cast<uint32_t>(size));
+    offset += size;
+    chunk = chunk * 3 % 1000 + 1;
+  }
+  REQUIRE(state.count == 1000000);
+  REQUIRE(
+      Final512(state) ==
+      FromHex<Digest512>(
+          "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973eb"
+          "de0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b"));
+}
+
+TEST_CASE("XeCryptSha512Final_copies_digest_to_buffer", "[crypt]") {
+  XECRYPT_SHA512_STATE state;
+  XeCryptSha512Init(&state);
+  XeCryptSha512Update(&state, Bytes("abc"), 3);
+  const XECRYPT_SHA512_STATE before = state;
+  const Digest512 digest = Final512(state);
 
   REQUIRE(state.count == 3);
   REQUIRE(std::memcmp(state.state, before.state, sizeof(state.state)) == 0);
