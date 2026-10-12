@@ -10,11 +10,14 @@
 #ifndef XENIA_KERNEL_XAM_XAM_MODULE_H_
 #define XENIA_KERNEL_XAM_XAM_MODULE_H_
 
+#include <memory>
+#include <mutex>
 #include <string>
 
 #include "xenia/cpu/export_resolver.h"
 #include "xenia/kernel/kernel_module.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/net/system_link.h"
 
 namespace xe {
 namespace kernel {
@@ -42,9 +45,16 @@ class XamModule : public KernelModule {
   const LoaderData& loader_data() const { return loader_data_; }
   LoaderData& loader_data() { return loader_data_; }
 
+  // Started on first use, see GetSystemLink.
+  std::shared_ptr<net::SystemLink> system_link();
+
  private:
   uint32_t callback_ = 0;
   LoaderData loader_data_;
+
+  std::mutex system_link_mutex_;
+  bool system_link_started_ = false;
+  std::shared_ptr<net::SystemLink> system_link_;
 };
 
 }  // namespace xam
