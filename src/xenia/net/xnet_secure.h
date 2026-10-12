@@ -119,6 +119,12 @@ std::optional<Packet> Decode(const ProtectionKeys& keys, uint32_t spi,
                              uint32_t sequence, std::span<const uint8_t> wire,
                              bool discovery = false);
 
+// Guest VDP datagrams start with the big endian size of the encrypted part,
+// the rest is sent in the clear.
+std::optional<Packet> FromGuestVdp(uint16_t source, uint16_t destination,
+                                   std::span<const uint8_t> guest);
+std::vector<uint8_t> ToGuestVdp(const Packet& packet);
+
 struct Exchange {
   bool response = false;
   uint16_t reserved = 0, hops = 127;

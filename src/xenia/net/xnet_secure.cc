@@ -432,6 +432,37 @@ std::optional<Packet> Decode(const ProtectionKeys& keys, uint32_t spi,
   return packet;
 }
 
+std::optional<Packet> FromGuestVdp(uint16_t source, uint16_t destination,
+                                   std::span<const uint8_t> guest) {
+  if (guest.size() < 2 || guest.size() > kMaxDatagramSize) {
+    return std::nullopt;
+  }
+  const size_t encrypted = Read(guest.first(2));
+  guest = guest.subspan(2);
+  if (encrypted > guest.size()) {
+    return std::nullopt;
+  }
+  Packet packet;
+  packet.kind = Kind::Vdp;
+  packet.source_port = source;
+  packet.destination_port = destination;
+  packet.encrypted.assign(guest.begin(), guest.begin() + encrypted);
+  packet.clear.assign(guest.begin() + encrypted, guest.end());
+  return packet;
+}
+
+std::vector<uint8_t> ToGuestVdp(const Packet& packet) {
+  if (packet.kind != Kind::Vdp || packet.encrypted.size() > 0xFFFF ||
+      packet.encrypted.size() + packet.clear.size() + 2 > kMaxDatagramSize) {
+    return {};
+  }
+  std::vector<uint8_t> result(2);
+  Write(result, packet.encrypted.size());
+  result.insert(result.end(), packet.encrypted.begin(), packet.encrypted.end());
+  result.insert(result.end(), packet.clear.begin(), packet.clear.end());
+  return result;
+}
+
 std::optional<std::array<uint8_t, 256>> EncodeExchange(
     const RegistrationKeys& keys, const Exchange& exchange) {
   if (!ValidExchange(exchange)) {
