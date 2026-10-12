@@ -11,7 +11,9 @@
 #define XENIA_NET_PACKET_TRANSPORT_H_
 
 #include <cstdint>
+#include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "xenia/net/xnet_secure.h"
@@ -30,6 +32,27 @@ class PacketTransport {
   // False on timeout or error.
   virtual bool Receive(std::vector<uint8_t>& frame, uint32_t timeout_ms) = 0;
 };
+
+// Host byte order.
+struct UdpEndpoint {
+  uint32_t address = 0;
+  uint16_t port = 0;
+};
+
+inline constexpr UdpEndpoint kKaiEngine{0x7F000001, 34523};
+
+// Exchanges frames with an XLink Kai engine over its DDS protocol. Kai drops
+// frames whose source MAC is not from a console vendor.
+std::unique_ptr<PacketTransport> OpenKaiTransport(const Mac& mac,
+                                                  UdpEndpoint engine,
+                                                  std::string& error);
+
+// Sends every frame as a UDP datagram to |destinations| and receives on
+// |port|, which several instances on one machine can share. Reaches other
+// Xenia instances only.
+std::unique_ptr<PacketTransport> OpenUdpTunnelTransport(
+    const Mac& mac, uint16_t port, std::vector<UdpEndpoint> destinations,
+    std::string& error);
 
 }  // namespace xe::net::secure
 
