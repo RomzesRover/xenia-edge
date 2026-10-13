@@ -45,7 +45,7 @@ jobs:
     permissions:
       contents: write
     if: |
-      github.repository == 'has207/xenia-edge' &&
+      github.repository == 'RomzesRover/xenia-edge' &&
       github.event_name == 'push' &&
       github.ref == 'refs/heads/edge'
     steps:
