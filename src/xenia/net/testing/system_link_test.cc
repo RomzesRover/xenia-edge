@@ -48,9 +48,14 @@ class TestTransport : public PacketTransport {
     wire_->changed.notify_all();
   }
 
+  // Delivers every frame sent from now on twice.
+  void Duplicate() { duplicate_ = true; }
+
   int Send(std::span<const uint8_t> bytes) override {
     std::lock_guard lock(wire_->mutex);
-    wire_->frames[1 - side_].emplace_back(bytes.begin(), bytes.end());
+    for (int i = duplicate_ ? 2 : 1; i; --i) {
+      wire_->frames[1 - side_].emplace_back(bytes.begin(), bytes.end());
+    }
     wire_->changed.notify_all();
     return static_cast<int>(bytes.size());
   }
@@ -72,6 +77,7 @@ class TestTransport : public PacketTransport {
   std::shared_ptr<Wire> wire_;
   unsigned side_;
   std::atomic<bool> healthy_{true};
+  std::atomic<bool> duplicate_{false};
 };
 
 struct Pair {
@@ -249,6 +255,24 @@ TEST_CASE("System Link ports pick a free port and unblock on close",
   CHECK(error == kWsaInterrupted);
   // A closed port frees its number.
   CHECK(Bind(*pair.b, 1000, false));
+}
+
+TEST_CASE("System Link delivers a frame that arrives twice once",
+          "[net][system_link]") {
+  Pair pair;
+  pair.transports[0]->Duplicate();
+  auto tx = Bind(*pair.a, 1001, false);
+  auto rx = Bind(*pair.b, 1001, false);
+  REQUIRE(tx);
+  REQUIRE(rx);
+  const std::array<uint8_t, 3> data{1, 3, 5};
+  uint32_t error = 0;
+  REQUIRE(tx->Send({0xFFFFFFFF, 1001}, data, error) == 3);
+  std::array<uint8_t, 16> buffer{};
+  Endpoint source;
+  REQUIRE(rx->Receive(buffer, false, source, 2000, error) == 3);
+  CHECK(rx->Receive(buffer, false, source, 200, error) == -1);
+  CHECK(error == kWsaTimedOut);
 }
 
 TEST_CASE("System Link registry checks key ids", "[net][system_link]") {

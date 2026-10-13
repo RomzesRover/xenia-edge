@@ -19,6 +19,7 @@
 #include <asio.hpp>
 
 #include "xenia/net/packet_transport.h"
+#include "xenia/net/subnet_broadcast.h"
 #include "xenia/net/system_link.h"
 
 #include "third_party/catch/include/catch.hpp"
@@ -115,6 +116,14 @@ TEST_CASE("UDP tunnel carries frames to other instances", "[net][transport]") {
   // Instances on one machine share the port.
   CHECK(OpenUdpTunnelTransport(kMacB, port_a, {}, error));
   CHECK(a->healthy());
+}
+
+TEST_CASE("Subnet broadcasts skip loopback", "[net][transport]") {
+  for (uint32_t address : SubnetBroadcastAddresses()) {
+    CHECK(address >> 24 != 127);
+    CHECK(address != 0);
+    CHECK(address != 0xFFFFFFFF);
+  }
 }
 
 TEST_CASE("System Links reach each other over the UDP tunnel",

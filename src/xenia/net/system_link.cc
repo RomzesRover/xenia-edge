@@ -17,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <stop_token>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -42,6 +43,8 @@ constexpr uint8_t kXbox360Platform = 1;
 
 constexpr size_t kKeyLimit = 8, kPeerLimit = 32;
 constexpr size_t kInboxLimit = 64, kPortLimit = 128;
+constexpr uint64_t kRepeatWindowMs = 500;
+constexpr size_t kRepeatLimit = 512;
 constexpr uint16_t kFirstDynamicPort = 49152;
 constexpr uint32_t kBroadcast = 0xFFFFFFFF;
 
@@ -125,6 +128,10 @@ struct SystemLink::State {
   Associations associations;
   std::map<std::pair<uint16_t, bool>, std::weak_ptr<Inbox>> ports;
   uint16_t next_port = kFirstDynamicPort;
+  // Hashes of recently received frames with their arrival time, oldest first.
+  // Only the worker touches them.
+  std::deque<std::pair<uint64_t, size_t>> recent;
+  bool reported_repeat = false;
   std::jthread worker;
 
   State(std::shared_ptr<secure::PacketTransport> io, AssociationConfig config)
@@ -147,7 +154,8 @@ struct SystemLink::State {
     threading::set_name("XNet System Link");
     while (!stop.stop_requested()) {
       std::vector<uint8_t> wire;
-      const bool received = transport->Receive(wire, 25);
+      const bool received =
+          transport->Receive(wire, 25) && !Repeat(wire, Now());
       std::vector<secure::Frame> outbound;
       {
         std::lock_guard lock(mutex);
@@ -175,6 +183,29 @@ struct SystemLink::State {
         }
       }
     }
+  }
+
+  // Copies of a frame can arrive through several subnets or a bridge. The
+  // protocol never sends the same frame twice so only such copies repeat.
+  bool Repeat(std::span<const uint8_t> wire, uint64_t now) {
+    const size_t hash = std::hash<std::string_view>()(std::string_view(
+        reinterpret_cast<const char*>(wire.data()), wire.size()));
+    while (!recent.empty() && now - recent.front().first > kRepeatWindowMs) {
+      recent.pop_front();
+    }
+    if (std::any_of(recent.begin(), recent.end(),
+                    [&](const auto& entry) { return entry.second == hash; })) {
+      if (!reported_repeat) {
+        reported_repeat = true;
+        XELOGI("System Link: dropping copies of frames that arrived twice");
+      }
+      return true;
+    }
+    if (recent.size() >= kRepeatLimit) {
+      recent.pop_front();
+    }
+    recent.emplace_back(now, hash);
+    return false;
   }
 
   // The rest expects mutex held.

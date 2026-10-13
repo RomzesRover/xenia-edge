@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <optional>
+#include <set>
 #include <string_view>
 
 #include <asio.hpp>
@@ -20,6 +21,7 @@
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
+#include "xenia/net/subnet_broadcast.h"
 
 namespace xe::net::secure {
 namespace {
@@ -28,6 +30,7 @@ using udp = asio::ip::udp;
 
 constexpr uint32_t kMtu = 1500;
 constexpr size_t kEthernetHeaderSize = 14;
+constexpr uint32_t kLimitedBroadcast = 0xFFFFFFFF;
 
 uint64_t Now() { return Clock::QueryHostUptimeMillis(); }
 
@@ -228,11 +231,7 @@ class KaiTransport final : public PacketTransport {
 class UdpTunnelTransport final : public PacketTransport {
  public:
   UdpTunnelTransport(const Mac& mac, std::vector<UdpEndpoint> destinations)
-      : mac_(mac) {
-    for (const auto& destination : destinations) {
-      destinations_.push_back(ToAsio(destination));
-    }
-  }
+      : mac_(mac), destinations_(std::move(destinations)) {}
 
   bool Open(uint16_t port, std::string& error) {
     return socket_.Open(0, port, true, error);
@@ -243,11 +242,12 @@ class UdpTunnelTransport final : public PacketTransport {
   bool healthy() const override { return healthy_; }
 
   int Send(std::span<const uint8_t> frame) override {
+    RefreshTargets();
     out_.assign(kTag.begin(), kTag.end());
     out_.insert(out_.end(), frame.begin(), frame.end());
     bool sent = false;
-    for (const auto& destination : destinations_) {
-      auto ec = socket_.SendTo(out_, destination);
+    for (const auto& target : targets_) {
+      auto ec = socket_.SendTo(out_, target);
       sent |= !ec || Transient(ec);
     }
     return sent ? static_cast<int>(frame.size()) : -1;
@@ -278,6 +278,15 @@ class UdpTunnelTransport final : public PacketTransport {
           std::equal(mac_.begin(), mac_.end(), payload.begin() + 6)) {
         continue;
       }
+      Mac source;
+      std::copy_n(payload.begin() + 6, source.size(), source.begin());
+      if (heard_.size() < 256 && heard_.insert(source).second) {
+        XELOGI(
+            "System Link tunnel: hearing "
+            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} from {}",
+            source[0], source[1], source[2], source[3], source[4], source[5],
+            sender.address().to_string());
+      }
       frame.assign(payload.begin(), payload.end());
       return true;
     }
@@ -287,8 +296,46 @@ class UdpTunnelTransport final : public PacketTransport {
  private:
   static constexpr std::string_view kTag = "XESL";
 
+  // Windows sends a limited broadcast out of one interface only, which can be
+  // a virtual one. Sending to the broadcast address of each subnet reaches
+  // them all. They are looked up again every 5 s since interfaces come and
+  // go.
+  void RefreshTargets() {
+    const uint64_t now = Now();
+    if (now < next_refresh_) {
+      return;
+    }
+    next_refresh_ = now + 5000;
+    std::vector<udp::endpoint> targets;
+    for (const auto& destination : destinations_) {
+      if (destination.address != kLimitedBroadcast) {
+        targets.push_back(ToAsio(destination));
+        continue;
+      }
+      auto subnets = SubnetBroadcastAddresses();
+      if (subnets.empty()) {
+        subnets.push_back(kLimitedBroadcast);
+      }
+      for (uint32_t subnet : subnets) {
+        targets.push_back(ToAsio({subnet, destination.port}));
+      }
+    }
+    if (targets != targets_) {
+      std::string list;
+      for (const auto& target : targets) {
+        list += fmt::format("{}{}:{}", list.empty() ? "" : ", ",
+                            target.address().to_string(), target.port());
+      }
+      XELOGI("System Link tunnel: sending to {}", list);
+      targets_ = std::move(targets);
+    }
+  }
+
   Mac mac_;
-  std::vector<udp::endpoint> destinations_;
+  std::vector<UdpEndpoint> destinations_;
+  std::vector<udp::endpoint> targets_;
+  uint64_t next_refresh_ = 0;
+  std::set<Mac> heard_;
   UdpSocket socket_;
   std::vector<uint8_t> out_;
   std::atomic<bool> healthy_{true};
